@@ -1,3 +1,6 @@
 export interface FaceRecognitionPlugin {
-  echo(options: { value: string }): Promise<{ value: string }>;
+  /**
+   * Mengirim path gambar ke Native, mengembalikan array of numbers (embeddings)
+   */
+  extractFaceFeature(options: { imageBase64: string }): Promise<{ embedding: number[] }>;
 }

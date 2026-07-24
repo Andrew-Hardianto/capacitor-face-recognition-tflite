@@ -26,24 +26,26 @@ npx cap sync
 
 <docgen-index>
 
-* [`echo(...)`](#echo)
+* [`extractFaceFeature(...)`](#extractfacefeature)
 
 </docgen-index>
 
 <docgen-api>
 <!--Update the source file JSDoc comments and rerun docgen to update the docs below-->
 
-### echo(...)
+### extractFaceFeature(...)
 
 ```typescript
-echo(options: { value: string; }) => Promise<{ value: string; }>
+extractFaceFeature(options: { imageBase64: string; }) => Promise<{ embedding: number[]; }>
 ```
 
-| Param         | Type                            |
-| ------------- | ------------------------------- |
-| **`options`** | <code>{ value: string; }</code> |
+Mengirim path gambar ke Native, mengembalikan array of numbers (embeddings)
 
-**Returns:** <code>Promise&lt;{ value: string; }&gt;</code>
+| Param         | Type                                  |
+| ------------- | ------------------------------------- |
+| **`options`** | <code>{ imageBase64: string; }</code> |
+
+**Returns:** <code>Promise&lt;{ embedding: number[]; }&gt;</code>
 
 --------------------
 
