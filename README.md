@@ -27,6 +27,7 @@ npx cap sync
 <docgen-index>
 
 * [`extractFaceFeature(...)`](#extractfacefeature)
+* [`compareFaces(...)`](#comparefaces)
 
 </docgen-index>
 
@@ -39,13 +40,30 @@ npx cap sync
 extractFaceFeature(options: { imageBase64: string; }) => Promise<{ embedding: number[]; }>
 ```
 
-Mengirim path gambar ke Native, mengembalikan array of numbers (embeddings)
+Mengirim base64 gambar ke Native, mengembalikan array of numbers (embeddings)
 
 | Param         | Type                                  |
 | ------------- | ------------------------------------- |
 | **`options`** | <code>{ imageBase64: string; }</code> |
 
 **Returns:** <code>Promise&lt;{ embedding: number[]; }&gt;</code>
+
+--------------------
+
+
+### compareFaces(...)
+
+```typescript
+compareFaces(options: { vector1: number[]; vector2: number[]; }) => Promise<{ distance: number; similarityPercentage: number; }>
+```
+
+Mengirim vector gambar ke Native, mengembalikan ismatch boolean
+
+| Param         | Type                                                   |
+| ------------- | ------------------------------------------------------ |
+| **`options`** | <code>{ vector1: number[]; vector2: number[]; }</code> |
+
+**Returns:** <code>Promise&lt;{ distance: number; similarityPercentage: number; }&gt;</code>
 
 --------------------
 

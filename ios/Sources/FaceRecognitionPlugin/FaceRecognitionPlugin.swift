@@ -10,7 +10,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "FaceRecognitionPlugin"
     public let jsName = "FaceRecognition"
     public let pluginMethods: [CAPPluginMethod] = [
-        CAPPluginMethod(name: "extractFaceFeature", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "extractFaceFeature", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "compareFaces", returnType: CAPPluginReturnPromise),
     ]
 
     // Implementasi utama dipisah ke file FaceRecognition.swift (opsional),
@@ -93,5 +94,31 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         } catch {
             call.reject("Gagal menjalankan Vision Request: \(error.localizedDescription)")
         }
+    }
+
+    @objc func compareFaces(_ call: CAPPluginCall) {
+        // Ambil array dari Angular (Float)
+        guard let vec1 = call.getArray("vector1", Float.self),
+            let vec2 = call.getArray("vector2", Float.self),
+            vec1.count == vec2.count
+        else {
+            call.reject("Vector tidak valid atau panjangnya tidak sama")
+            return
+        }
+
+        var sum: Float = 0
+        for i in 0..<vec1.count {
+            let diff = vec1[i] - vec2[i]
+            sum += diff * diff
+        }
+
+        let distance = sqrt(sum)
+        var similarityPercentage = 100.0 - (distance * 30.0)
+        if similarityPercentage < 0 { similarityPercentage = 0 }
+
+        call.resolve([
+            "distance": distance,
+            "similarityPercentage": similarityPercentage,
+        ])
     }
 }

@@ -81,4 +81,35 @@ public class FaceRecognitionPlugin extends Plugin {
             call.reject("Error memproses gambar", e);
         }
     }
+
+    @PluginMethod
+    public void compareFaces(PluginCall call) {
+        try {
+            org.json.JSONArray vec1Json = call.getArray("vector1");
+            org.json.JSONArray vec2Json = call.getArray("vector2");
+
+            if (vec1Json == null || vec2Json == null || vec1Json.length() != vec2Json.length()) {
+                call.reject("Vector tidak valid atau panjangnya tidak sama");
+                return;
+            }
+
+            double sum = 0;
+            for (int i = 0; i < vec1Json.length(); i++) {
+                double diff = vec1Json.getDouble(i) - vec2Json.getDouble(i);
+                sum += diff * diff;
+            }
+            
+            double distance = Math.sqrt(sum);
+            boolean isMatch = distance < 1.0;
+            double similarityPercentage = 100.0 - (distance * 30.0);
+            if (similarityPercentage < 0) similarityPercentage = 0;
+
+            JSObject ret = new JSObject();
+            ret.put("distance", distance);
+            ret.put("similarityPercentage", similarityPercentage);
+            call.resolve(ret);
+        } catch (Exception e) {
+            call.reject("Gagal membandingkan wajah", e);
+        }
+    }
 }
