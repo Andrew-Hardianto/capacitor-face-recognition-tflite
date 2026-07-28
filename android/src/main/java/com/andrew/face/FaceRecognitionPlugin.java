@@ -93,20 +93,41 @@ public class FaceRecognitionPlugin extends Plugin {
                 return;
             }
 
-            double sum = 0;
+            double dotProduct = 0.0;
+            double norm1 = 0.0;
+            double norm2 = 0.0;
+            
+            // Menghitung Cosine Similarity
             for (int i = 0; i < vec1Json.length(); i++) {
-                double diff = vec1Json.getDouble(i) - vec2Json.getDouble(i);
-                sum += diff * diff;
+                double v1 = vec1Json.getDouble(i);
+                double v2 = vec2Json.getDouble(i);
+                
+                dotProduct += v1 * v2;
+                norm1 += v1 * v1;
+                norm2 += v2 * v2;
             }
             
-            double distance = Math.sqrt(sum);
-            boolean isMatch = distance < 1.0;
-            double similarityPercentage = 100.0 - (distance * 30.0);
-            if (similarityPercentage < 0) similarityPercentage = 0;
+            // Mencegah pembagian dengan nol jika data cacat
+            if (norm1 == 0 || norm2 == 0) {
+                call.reject("Data vektor ada yang bernilai nol");
+                return;
+            }
+
+            double cosineSimilarity = dotProduct / (Math.sqrt(norm1) * Math.sqrt(norm2));
+            
+            // THRESHOLD / AMBANG BATAS
+            // 0.75 adalah standar yang baik. 
+            // Jika masih tembus wajah orang lain, naikkan ke 0.80 atau 0.85
+            boolean isMatch = cosineSimilarity > 0.75; 
+            
+            // Persentase kemiripan yang lebih akurat
+            double similarityPercentage = Math.max(0, cosineSimilarity * 100.0);
 
             JSObject ret = new JSObject();
-            ret.put("distance", distance);
+            ret.put("isMatch", isMatch); // Mengirimkan status True/False ke frontend
             ret.put("similarityPercentage", similarityPercentage);
+            ret.put("score", cosineSimilarity);
+            
             call.resolve(ret);
         } catch (Exception e) {
             call.reject("Gagal membandingkan wajah", e);
