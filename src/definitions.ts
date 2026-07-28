@@ -5,7 +5,12 @@ export interface FaceRecognitionPlugin {
   extractFaceFeature(options: { imageBase64: string }): Promise<{ embedding: number[] }>;
 
   /**
-   * Mengirim vector gambar ke Native, mengembalikan ismatch boolean
+   * Membandingkan dua embedding wajah menggunakan Cosine Similarity.
+   * Mengembalikan isMatch (threshold 0.75), score cosine, dan persentase kemiripan.
    */
-  compareFaces(options: { vector1: number[], vector2: number[] }): Promise<{ distance: number, similarityPercentage: number }>;
+  compareFaces(options: { vector1: number[], vector2: number[] }): Promise<{
+    isMatch: boolean;
+    score: number;
+    similarityPercentage: number;
+  }>;
 }

@@ -54,16 +54,17 @@ Mengirim base64 gambar ke Native, mengembalikan array of numbers (embeddings)
 ### compareFaces(...)
 
 ```typescript
-compareFaces(options: { vector1: number[]; vector2: number[]; }) => Promise<{ distance: number; similarityPercentage: number; }>
+compareFaces(options: { vector1: number[]; vector2: number[]; }) => Promise<{ isMatch: boolean; score: number; similarityPercentage: number; }>
 ```
 
-Mengirim vector gambar ke Native, mengembalikan ismatch boolean
+Membandingkan dua embedding wajah menggunakan Cosine Similarity.
+Mengembalikan isMatch (threshold 0.75), score cosine, dan persentase kemiripan.
 
 | Param         | Type                                                   |
 | ------------- | ------------------------------------------------------ |
 | **`options`** | <code>{ vector1: number[]; vector2: number[]; }</code> |
 
-**Returns:** <code>Promise&lt;{ distance: number; similarityPercentage: number; }&gt;</code>
+**Returns:** <code>Promise&lt;{ isMatch: boolean; score: number; similarityPercentage: number; }&gt;</code>
 
 --------------------
 
