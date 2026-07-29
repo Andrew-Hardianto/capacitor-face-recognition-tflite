@@ -36,8 +36,8 @@ public class FaceRecognitionPlugin extends Plugin {
     private static final int INPUT_SIZE = 112;
     // Jumlah channel warna (RGB = 3)
     private static final int PIXEL_CHANNELS = 3;
-    // Ukuran output embedding model (MobileFaceNet = 128)
-    private static final int EMBEDDING_SIZE = 128;
+    // Ukuran output embedding model (model ini output 192 dimensi, bukan 128)
+    private static final int EMBEDDING_SIZE = 192;
     // Ukuran byte per float
     private static final int BYTES_PER_FLOAT = 4;
 
