@@ -37,7 +37,12 @@ export interface FaceRecognitionPlugin {
    *
    * @param options.imageBase64 - Gambar dalam format Base64
    * @returns count - Jumlah wajah yang terdeteksi
-   * @returns faces - Array bounding box tiap wajah: { x, y, width, height }
+   * @returns faces - Array metadata tiap wajah:
+   *   - x, y, width, height: bounding box dalam piksel
+   *   - headEulerAngleY: rotasi horizontal kepala (negatif=kiri, positif=kanan), dalam derajat
+   *   - headEulerAngleZ: rotasi roll kepala (negatif=miring kiri), dalam derajat
+   *   - leftEyeOpenProbability: probabilitas mata kiri terbuka (0.0-1.0), null jika tidak tersedia
+   *   - rightEyeOpenProbability: probabilitas mata kanan terbuka (0.0-1.0), null jika tidak tersedia
    */
   detectFaces(options: { imageBase64: string }): Promise<{
     count: number;
@@ -46,6 +51,10 @@ export interface FaceRecognitionPlugin {
       y: number;
       width: number;
       height: number;
+      headEulerAngleY: number;
+      headEulerAngleZ: number;
+      leftEyeOpenProbability: number | null;
+      rightEyeOpenProbability: number | null;
     }>;
   }>;
 }

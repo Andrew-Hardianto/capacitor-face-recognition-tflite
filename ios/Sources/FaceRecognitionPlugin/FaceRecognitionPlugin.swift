@@ -236,11 +236,12 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     // detectFaces
     // ============================
     /// Mendeteksi semua wajah dalam gambar menggunakan Apple Vision.
-    /// Mengembalikan jumlah wajah dan bounding box tiap wajah (koordinat piksel).
+    /// Mengembalikan jumlah wajah, bounding box, euler angles, dan estimasi eye open probability.
     ///
-    /// Berguna untuk validasi awal:
-    ///   - Pastikan tepat 1 wajah terdeteksi sebelum extractFaceFeature
-    ///   - Dapatkan koordinat wajah untuk UI feedback / overlay
+    /// Berguna untuk validasi kualitas frame kamera:
+    ///   - Pastikan tepat 1 wajah (count == 1)
+    ///   - Cek kepala lurus: abs(headEulerAngleY) < 15 && abs(headEulerAngleZ) < 15
+    ///   - Cek mata terbuka: leftEyeOpenProbability > 0.4 && rightEyeOpenProbability > 0.4
     @objc func detectFaces(_ call: CAPPluginCall) {
         // 1. Decode Base64 ke UIImage
         guard let imageBase64 = call.getString("imageBase64"),
@@ -252,32 +253,69 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
-        // 2. Deteksi wajah menggunakan Apple Vision
-        let request = VNDetectFaceRectanglesRequest { (req, error) in
+        let imgWidth  = image.size.width
+        let imgHeight = image.size.height
+
+        // 2. Gunakan VNDetectFaceLandmarksRequest untuk mendapatkan:
+        //    - bounding box wajah
+        //    - roll & yaw (euler angles)
+        //    - face landmarks (untuk estimasi eye open probability)
+        let landmarksRequest = VNDetectFaceLandmarksRequest { (req, error) in
             if let err = error {
                 call.reject("Vision gagal mendeteksi: \(err.localizedDescription)")
                 return
             }
 
             let results = req.results as? [VNFaceObservation] ?? []
-            let imgWidth  = image.size.width
-            let imgHeight = image.size.height
-
-            // 3. Konversi setiap bounding box dari Vision (kiri-bawah) ke koordinat piksel (kiri-atas)
             var facesArray: [[String: Any]] = []
+
             for face in results {
                 let bb = face.boundingBox
+
+                // 3. Konversi bounding box Vision (kiri-bawah, normalized) → piksel (kiri-atas)
                 let x      = bb.origin.x * imgWidth
                 let y      = (1 - bb.origin.y - bb.size.height) * imgHeight
                 let width  = bb.size.width  * imgWidth
                 let height = bb.size.height * imgHeight
 
-                facesArray.append([
-                    "x":      Int(max(0, x)),
-                    "y":      Int(max(0, y)),
-                    "width":  Int(min(width,  imgWidth  - max(0, x))),
-                    "height": Int(min(height, imgHeight - max(0, y))),
-                ])
+                // 4. Euler angles dari VNFaceObservation (dalam radian → konversi ke derajat)
+                // roll  = headEulerAngleZ (miring kiri/kanan)
+                // yaw   = headEulerAngleY (menghadap kiri/kanan)
+                let eulerZ = face.roll.map { Double(truncating: $0) * (180.0 / .pi) } ?? 0.0
+                let eulerY = face.yaw.map  { Double(truncating: $0) * (180.0 / .pi) } ?? 0.0
+
+                // 5. Estimasi eye open probability dari face landmarks (Eye Aspect Ratio)
+                // Apple Vision tidak menyediakan ini secara native, jadi kita estimasi dari
+                // jarak kelopak mata atas-bawah dibagi lebar mata (EAR)
+                var leftEyeProb:  Double? = nil
+                var rightEyeProb: Double? = nil
+
+                if let landmarks = face.landmarks {
+                    // Eye Aspect Ratio (EAR) = tinggi mata / lebar mata
+                    // Threshold EAR > ~0.2 = mata terbuka, < 0.2 = mata tertutup/merem
+                    // Kita normalisasi ke range 0.0-1.0 agar konsisten dengan Android
+
+                    if let leftEye = landmarks.leftEye, leftEye.pointCount >= 6 {
+                        leftEyeProb = self.eyeOpenProbability(from: leftEye.normalizedPoints)
+                    }
+                    if let rightEye = landmarks.rightEye, rightEye.pointCount >= 6 {
+                        rightEyeProb = self.eyeOpenProbability(from: rightEye.normalizedPoints)
+                    }
+                }
+
+                var faceDict: [String: Any] = [
+                    "x":               Int(max(0, x)),
+                    "y":               Int(max(0, y)),
+                    "width":           Int(min(width,  imgWidth  - max(0, x))),
+                    "height":          Int(min(height, imgHeight - max(0, y))),
+                    "headEulerAngleY": eulerY,
+                    "headEulerAngleZ": eulerZ,
+                ]
+                // Gunakan NSNull agar JS menerima null (bukan undefined)
+                faceDict["leftEyeOpenProbability"]  = leftEyeProb  as Any? ?? NSNull()
+                faceDict["rightEyeOpenProbability"] = rightEyeProb as Any? ?? NSNull()
+
+                facesArray.append(faceDict)
             }
 
             call.resolve([
@@ -286,13 +324,31 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             ])
         }
 
-        // 4. Eksekusi Vision Request
+        // 6. Eksekusi Vision Request
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         do {
-            try handler.perform([request])
+            try handler.perform([landmarksRequest])
         } catch {
             call.reject("Gagal menjalankan Vision Request: \(error.localizedDescription)")
         }
+    }
+
+    /// Menghitung Eye Aspect Ratio (EAR) dari normalized landmark points mata.
+    /// EAR = (tinggi atas-bawah rata-rata) / lebar mata
+    /// Hasil dinormalisasi ke probabilitas 0.0-1.0 (0=pasti merem, 1=pasti terbuka)
+    private func eyeOpenProbability(from points: [CGPoint]) -> Double {
+        guard points.count >= 6 else { return 1.0 }
+        // Eye landmark order (Vision): 0=kiri, 1=kiri-atas, 2=kanan-atas, 3=kanan, 4=kanan-bawah, 5=kiri-bawah
+        let eyeWidth  = hypot(points[3].x - points[0].x, points[3].y - points[0].y)
+        guard eyeWidth > 0 else { return 1.0 }
+
+        let height1 = hypot(points[1].x - points[5].x, points[1].y - points[5].y)
+        let height2 = hypot(points[2].x - points[4].x, points[2].y - points[4].y)
+        let ear = Double((height1 + height2) / (2.0 * eyeWidth))
+
+        // EAR biasanya 0.2-0.4 saat terbuka, < 0.1 saat tertutup
+        // Normalisasi ke 0.0-1.0: probability = clamp(ear / 0.3, 0, 1)
+        return min(1.0, max(0.0, ear / 0.3))
     }
 
     // ============================

@@ -57,11 +57,18 @@ public class FaceRecognitionPlugin extends Plugin {
     // Nilai default: 0.5 — bisa dinaikkan ke 0.6 untuk lebih ketat
     private static final float LIVENESS_THRESHOLD = 0.5f;
 
-    // ML Kit Face Detector
+    // ML Kit Face Detector — digunakan untuk extractFaceFeature & checkLiveness (cepat, tanpa klasifikasi)
     private final FaceDetectorOptions options = new FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
             .build();
     private final FaceDetector detector = FaceDetection.getClient(options);
+
+    // ML Kit Face Detector — digunakan untuk detectFaces (dengan klasifikasi: euler angle + eye open probability)
+    private final FaceDetectorOptions metaOptions = new FaceDetectorOptions.Builder()
+            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+            .build();
+    private final FaceDetector metaDetector = FaceDetection.getClient(metaOptions);
 
     // TFLite Interpreter — Face Recognition
     private Interpreter tfliteInterpreter;
@@ -237,12 +244,13 @@ public class FaceRecognitionPlugin extends Plugin {
     }
 
     /**
-     * Mendeteksi semua wajah dalam gambar menggunakan ML Kit.
-     * Mengembalikan jumlah wajah dan bounding box tiap wajah.
+     * Mendeteksi semua wajah dalam gambar menggunakan ML Kit dengan mode klasifikasi penuh.
+     * Mengembalikan jumlah wajah, bounding box, euler angles, dan eye open probability.
      *
-     * Berguna untuk validasi awal sebelum extractFaceFeature:
-     *   - Pastikan tepat 1 wajah terdeteksi
-     *   - Dapatkan koordinat wajah untuk UI feedback
+     * Berguna untuk validasi kualitas frame kamera sebelum extractFaceFeature:
+     *   - Pastikan tepat 1 wajah (faces.count === 1)
+     *   - Cek kepala lurus: Math.abs(headEulerAngleY) < 15 && Math.abs(headEulerAngleZ) < 15
+     *   - Cek mata terbuka: leftEyeOpenProbability > 0.4 && rightEyeOpenProbability > 0.4
      *
      * @param call PluginCall dengan parameter "imageBase64" (string Base64)
      */
@@ -260,26 +268,39 @@ public class FaceRecognitionPlugin extends Plugin {
             Bitmap bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.length);
             InputImage image = InputImage.fromBitmap(bitmap, 0);
 
-            // 2. Jalankan ML Kit Face Detector
-            detector.process(image)
+            // 2. Jalankan metaDetector (CLASSIFICATION_MODE_ALL aktif)
+            metaDetector.process(image)
                 .addOnSuccessListener(faces -> {
                     try {
-                        // 3. Susun array bounding box untuk setiap wajah
                         JSONArray facesArray = new JSONArray();
                         for (Face face : faces) {
                             Rect bounds = face.getBoundingBox();
 
-                            // Klem koordinat agar tidak keluar batas bitmap
+                            // Bounding box — klem agar tidak keluar batas bitmap
                             int x      = Math.max(0, bounds.left);
                             int y      = Math.max(0, bounds.top);
                             int width  = Math.min(bounds.width(), bitmap.getWidth() - x);
                             int height = Math.min(bounds.height(), bitmap.getHeight() - y);
+
+                            // Euler angles — tersedia default dari ML Kit
+                            float eulerY = face.getHeadEulerAngleY(); // rotasi horizontal (kiri/kanan)
+                            float eulerZ = face.getHeadEulerAngleZ(); // rotasi roll (miring)
+
+                            // Eye open probability — hanya tersedia dengan CLASSIFICATION_MODE_ALL
+                            // Mengembalikan null jika tidak bisa dihitung (wajah terlalu kecil, dll)
+                            Float leftEyeProb  = face.getLeftEyeOpenProbability();
+                            Float rightEyeProb = face.getRightEyeOpenProbability();
 
                             JSObject faceObj = new JSObject();
                             faceObj.put("x", x);
                             faceObj.put("y", y);
                             faceObj.put("width", width);
                             faceObj.put("height", height);
+                            faceObj.put("headEulerAngleY", eulerY);
+                            faceObj.put("headEulerAngleZ", eulerZ);
+                            // Gunakan JSObject.NULL agar JS menerima null (bukan undefined)
+                            faceObj.put("leftEyeOpenProbability",  leftEyeProb  != null ? leftEyeProb  : JSObject.NULL);
+                            faceObj.put("rightEyeOpenProbability", rightEyeProb != null ? rightEyeProb : JSObject.NULL);
                             facesArray.put(faceObj);
                         }
 
