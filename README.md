@@ -154,7 +154,7 @@ Memerlukan model `anti_spoof.tflite` di folder assets (Android) atau bundle (iOS
 ### detectFaces(...)
 
 ```typescript
-detectFaces(options: { imageBase64: string; }) => Promise<{ count: number; faces: Array<{ x: number; y: number; width: number; height: number; }>; }>
+detectFaces(options: { imageBase64: string; }) => Promise<{ count: number; faces: Array<{ x: number; y: number; width: number; height: number; headEulerAngleY: number; headEulerAngleZ: number; leftEyeOpenProbability: number | null; rightEyeOpenProbability: number | null; }>; }>
 ```
 
 Mendeteksi semua wajah dalam gambar tanpa melakukan recognition.
@@ -164,7 +164,7 @@ Berguna untuk validasi awal: pastikan tepat 1 wajah sebelum proses berikutnya.
 | ------------- | ------------------------------------- |
 | **`options`** | <code>{ imageBase64: string; }</code> |
 
-**Returns:** <code>Promise&lt;{ count: number; faces: { x: number; y: number; width: number; height: number; }[]; }&gt;</code>
+**Returns:** <code>Promise&lt;{ count: number; faces: { x: number; y: number; width: number; height: number; headEulerAngleY: number; headEulerAngleZ: number; leftEyeOpenProbability: number | null; rightEyeOpenProbability: number | null; }[]; }&gt;</code>
 
 --------------------
 

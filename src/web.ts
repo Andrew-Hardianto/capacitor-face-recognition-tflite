@@ -53,7 +53,16 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
 
   async detectFaces(_options: { imageBase64: string }): Promise<{
     count: number;
-    faces: Array<{ x: number; y: number; width: number; height: number }>;
+    faces: Array<{
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      headEulerAngleY: number;
+      headEulerAngleZ: number;
+      leftEyeOpenProbability: number | null;
+      rightEyeOpenProbability: number | null;
+    }>;
   }> {
     console.warn('detectFaces hanya berjalan di Android & iOS native.');
     return { count: 0, faces: [] };
