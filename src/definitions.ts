@@ -46,6 +46,10 @@ export interface FaceRecognitionPlugin {
       y: number;
       width: number;
       height: number;
+      headEulerAngleY: number;
+      headEulerAngleZ: number;
+      leftEyeOpenProbability: number | null;
+      rightEyeOpenProbability: number | null;
     }>;
   }>;
 }
