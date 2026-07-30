@@ -50,4 +50,12 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
     console.warn('checkLiveness (Anti-Spoofing) hanya berjalan di Android & iOS native.');
     return { isLive: false, score: 0, confidence: 'LOW' };
   }
+
+  async detectFaces(_options: { imageBase64: string }): Promise<{
+    count: number;
+    faces: Array<{ x: number; y: number; width: number; height: number }>;
+  }> {
+    console.warn('detectFaces hanya berjalan di Android & iOS native.');
+    return { count: 0, faces: [] };
+  }
 }

@@ -15,6 +15,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "extractFaceFeature", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "compareFaces", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "checkLiveness", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "detectFaces", returnType: CAPPluginReturnPromise),
     ]
 
     // ============================
@@ -229,6 +230,69 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             "similarityPercentage": similarityPercentage,
             "score": cosineSimilarity,
         ])
+    }
+
+    // ============================
+    // detectFaces
+    // ============================
+    /// Mendeteksi semua wajah dalam gambar menggunakan Apple Vision.
+    /// Mengembalikan jumlah wajah dan bounding box tiap wajah (koordinat piksel).
+    ///
+    /// Berguna untuk validasi awal:
+    ///   - Pastikan tepat 1 wajah terdeteksi sebelum extractFaceFeature
+    ///   - Dapatkan koordinat wajah untuk UI feedback / overlay
+    @objc func detectFaces(_ call: CAPPluginCall) {
+        // 1. Decode Base64 ke UIImage
+        guard let imageBase64 = call.getString("imageBase64"),
+              let data = Data(base64Encoded: imageBase64, options: .ignoreUnknownCharacters),
+              let image = UIImage(data: data),
+              let cgImage = image.cgImage
+        else {
+            call.reject("Gagal decode Base64 menjadi gambar")
+            return
+        }
+
+        // 2. Deteksi wajah menggunakan Apple Vision
+        let request = VNDetectFaceRectanglesRequest { (req, error) in
+            if let err = error {
+                call.reject("Vision gagal mendeteksi: \(err.localizedDescription)")
+                return
+            }
+
+            let results = req.results as? [VNFaceObservation] ?? []
+            let imgWidth  = image.size.width
+            let imgHeight = image.size.height
+
+            // 3. Konversi setiap bounding box dari Vision (kiri-bawah) ke koordinat piksel (kiri-atas)
+            var facesArray: [[String: Any]] = []
+            for face in results {
+                let bb = face.boundingBox
+                let x      = bb.origin.x * imgWidth
+                let y      = (1 - bb.origin.y - bb.size.height) * imgHeight
+                let width  = bb.size.width  * imgWidth
+                let height = bb.size.height * imgHeight
+
+                facesArray.append([
+                    "x":      Int(max(0, x)),
+                    "y":      Int(max(0, y)),
+                    "width":  Int(min(width,  imgWidth  - max(0, x))),
+                    "height": Int(min(height, imgHeight - max(0, y))),
+                ])
+            }
+
+            call.resolve([
+                "count": results.count,
+                "faces": facesArray,
+            ])
+        }
+
+        // 4. Eksekusi Vision Request
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            call.reject("Gagal menjalankan Vision Request: \(error.localizedDescription)")
+        }
     }
 
     // ============================

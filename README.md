@@ -100,21 +100,16 @@ Plugin menyertakan kedua model TFLite langsung di dalam package — **tidak perl
 extractFaceFeature(options: { imageBase64: string; }) => Promise<{ embedding: number[]; }>
 ```
 
-Mendeteksi wajah dari gambar dan mengekstrak embedding 192-dimensi menggunakan model MobileFaceNet.
+Mengirim base64 gambar ke Native, mengembalikan array of numbers (embeddings)
 
-| Param | Type | Keterangan |
-|-------|------|-----------|
-| `imageBase64` | `string` | Gambar dalam format Base64 (JPEG/PNG) |
+| Param         | Type                                  |
+| ------------- | ------------------------------------- |
+| **`options`** | <code>{ imageBase64: string; }</code> |
 
-**Returns:** `Promise<{ embedding: number[] }>`
-
-| Return | Type | Keterangan |
-|--------|------|-----------|
-| `embedding` | `number[]` | Array 192 angka float yang merepresentasikan fitur wajah |
-
-**Error:** Reject jika tidak ada wajah terdeteksi atau gambar tidak valid.
+**Returns:** <code>Promise&lt;{ embedding: number[]; }&gt;</code>
 
 --------------------
+
 
 ### compareFaces(...)
 
@@ -122,24 +117,17 @@ Mendeteksi wajah dari gambar dan mengekstrak embedding 192-dimensi menggunakan m
 compareFaces(options: { vector1: number[]; vector2: number[]; }) => Promise<{ isMatch: boolean; score: number; similarityPercentage: number; }>
 ```
 
-Membandingkan dua embedding wajah menggunakan **Cosine Similarity**.
+Membandingkan dua embedding wajah menggunakan Cosine Similarity.
+Mengembalikan isMatch (threshold 0.75), score cosine, dan persentase kemiripan.
 
-| Param | Type | Keterangan |
-|-------|------|-----------|
-| `vector1` | `number[]` | Embedding wajah pertama |
-| `vector2` | `number[]` | Embedding wajah kedua |
+| Param         | Type                                                   |
+| ------------- | ------------------------------------------------------ |
+| **`options`** | <code>{ vector1: number[]; vector2: number[]; }</code> |
 
-**Returns:**
-
-| Field | Type | Keterangan |
-|-------|------|-----------|
-| `isMatch` | `boolean` | `true` jika wajah sama (threshold: cosine > 0.75) |
-| `score` | `number` | Nilai Cosine Similarity: `-1.0` s/d `1.0` |
-| `similarityPercentage` | `number` | Persentase kemiripan: `0` s/d `100` |
-
-**Error:** Reject jika panjang vector berbeda atau vector bernilai nol.
+**Returns:** <code>Promise&lt;{ isMatch: boolean; score: number; similarityPercentage: number; }&gt;</code>
 
 --------------------
+
 
 ### checkLiveness(...)
 
@@ -147,31 +135,16 @@ Membandingkan dua embedding wajah menggunakan **Cosine Similarity**.
 checkLiveness(options: { imageBase64: string; }) => Promise<{ isLive: boolean; score: number; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; }>
 ```
 
-Memeriksa apakah wajah adalah **wajah asli (live)** atau **spoofing** (foto cetak, layar HP/tablet, video replay, topeng).
+Memeriksa apakah wajah dalam gambar adalah wajah asli (live) atau spoofing
+(foto cetak, layar HP, video, topeng).
 
-Menggunakan model **MiniFASNetV1** yang berjalan sepenuhnya on-device.
+Memerlukan model `anti_spoof.tflite` di folder assets (Android) atau bundle (iOS).
 
-| Param | Type | Keterangan |
-|-------|------|-----------|
-| `imageBase64` | `string` | Gambar dalam format Base64 (JPEG/PNG) |
+| Param         | Type                                  |
+| ------------- | ------------------------------------- |
+| **`options`** | <code>{ imageBase64: string; }</code> |
 
-**Returns:**
-
-| Field | Type | Keterangan |
-|-------|------|-----------|
-| `isLive` | `boolean` | `true` = wajah asli, `false` = spoofing terdeteksi |
-| `score` | `number` | Skor liveness: `0.0` (pasti spoof) s/d `1.0` (pasti live) |
-| `confidence` | `'HIGH' \| 'MEDIUM' \| 'LOW'` | Tingkat kepercayaan hasil deteksi |
-
-**Confidence levels:**
-
-| Level | Kondisi | Arti |
-|-------|---------|------|
-| `HIGH` | score > 0.85 atau < 0.15 | Model sangat yakin |
-| `MEDIUM` | score > 0.6 atau < 0.4 | Model cukup yakin |
-| `LOW` | score antara 0.4 – 0.6 | Hasil ambigu, perlu review |
-
-**Error:** Reject jika tidak ada wajah terdeteksi atau gambar tidak valid.
+**Returns:** <code>Promise&lt;{ isLive: boolean; score: number; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; }&gt;</code>
 
 --------------------
 

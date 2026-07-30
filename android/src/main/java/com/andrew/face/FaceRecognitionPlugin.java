@@ -237,6 +237,68 @@ public class FaceRecognitionPlugin extends Plugin {
     }
 
     /**
+     * Mendeteksi semua wajah dalam gambar menggunakan ML Kit.
+     * Mengembalikan jumlah wajah dan bounding box tiap wajah.
+     *
+     * Berguna untuk validasi awal sebelum extractFaceFeature:
+     *   - Pastikan tepat 1 wajah terdeteksi
+     *   - Dapatkan koordinat wajah untuk UI feedback
+     *
+     * @param call PluginCall dengan parameter "imageBase64" (string Base64)
+     */
+    @PluginMethod
+    public void detectFaces(PluginCall call) {
+        String imageBase64 = call.getString("imageBase64");
+        if (imageBase64 == null) {
+            call.reject("Base64 gambar tidak boleh kosong");
+            return;
+        }
+
+        try {
+            // 1. Decode Base64 ke Bitmap
+            byte[] decodedString = android.util.Base64.decode(imageBase64, android.util.Base64.DEFAULT);
+            Bitmap bitmap = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.length);
+            InputImage image = InputImage.fromBitmap(bitmap, 0);
+
+            // 2. Jalankan ML Kit Face Detector
+            detector.process(image)
+                .addOnSuccessListener(faces -> {
+                    try {
+                        // 3. Susun array bounding box untuk setiap wajah
+                        JSONArray facesArray = new JSONArray();
+                        for (Face face : faces) {
+                            Rect bounds = face.getBoundingBox();
+
+                            // Klem koordinat agar tidak keluar batas bitmap
+                            int x      = Math.max(0, bounds.left);
+                            int y      = Math.max(0, bounds.top);
+                            int width  = Math.min(bounds.width(), bitmap.getWidth() - x);
+                            int height = Math.min(bounds.height(), bitmap.getHeight() - y);
+
+                            JSObject faceObj = new JSObject();
+                            faceObj.put("x", x);
+                            faceObj.put("y", y);
+                            faceObj.put("width", width);
+                            faceObj.put("height", height);
+                            facesArray.put(faceObj);
+                        }
+
+                        JSObject ret = new JSObject();
+                        ret.put("count", faces.size());
+                        ret.put("faces", facesArray);
+                        call.resolve(ret);
+                    } catch (Exception e) {
+                        call.reject("Gagal mem-parsing hasil deteksi wajah", e);
+                    }
+                })
+                .addOnFailureListener(e -> call.reject("ML Kit gagal mendeteksi wajah", e));
+
+        } catch (Exception e) {
+            call.reject("Error memproses gambar", e);
+        }
+    }
+
+    /**
      * Memeriksa apakah wajah dalam gambar adalah wajah asli (live) atau spoofing.
      *
      * Alur kerja:

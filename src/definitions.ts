@@ -30,4 +30,22 @@ export interface FaceRecognitionPlugin {
     score: number;
     confidence: 'HIGH' | 'MEDIUM' | 'LOW';
   }>;
+
+  /**
+   * Mendeteksi semua wajah dalam gambar tanpa melakukan recognition.
+   * Berguna untuk validasi awal: pastikan tepat 1 wajah sebelum proses berikutnya.
+   *
+   * @param options.imageBase64 - Gambar dalam format Base64
+   * @returns count - Jumlah wajah yang terdeteksi
+   * @returns faces - Array bounding box tiap wajah: { x, y, width, height }
+   */
+  detectFaces(options: { imageBase64: string }): Promise<{
+    count: number;
+    faces: Array<{
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    }>;
+  }>;
 }
