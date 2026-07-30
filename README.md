@@ -1,14 +1,53 @@
 # capacitor-face-recognition-tflite
 
-Capacitor plugin untuk Face Recognition + **Anti-Spoofing (Liveness Detection)** menggunakan ML Kit & TFLite.
+Capacitor plugin untuk **Face Recognition** + **Anti-Spoofing (Passive Liveness Detection)** menggunakan ML Kit & TensorFlow Lite, berjalan sepenuhnya on-device tanpa koneksi internet.
 
-## Fitur
+---
 
-| Fitur | Android | iOS |
-|-------|---------|-----|
-| Ekstraksi embedding wajah | ✅ | ✅ |
-| Perbandingan wajah (Cosine Similarity) | ✅ | ✅ |
-| **Anti-Spoofing / Liveness Detection** | ✅ | ✅ |
+## Platform Support
+
+| Platform | Face Recognition | Liveness Detection |
+|----------|:-:|:-:|
+| Android | ✅ | ✅ |
+| iOS | ✅ | ✅ |
+| Web | ⚠️ Stub only | ⚠️ Stub only |
+
+---
+
+## Requirements
+
+### Capacitor
+
+| Dependency | Minimum Version |
+|------------|----------------|
+| `@capacitor/core` | `>= 8.0.0` |
+
+### Android
+
+| Requirement | Minimum |
+|-------------|---------|
+| **Android API Level** | `24` (Android 7.0 Nougat) |
+| **compileSdk** | `36` |
+| **targetSdk** | `36` |
+| **Java** | `21` |
+| **Gradle** | `8.13.0` |
+| `com.google.mlkit:face-detection` | `16.1.5` |
+| `org.tensorflow:tensorflow-lite` | `2.14.0` |
+| `org.tensorflow:tensorflow-lite-support` | `0.4.4` |
+
+> ⚠️ ML Kit Face Detection memerlukan **Google Play Services** yang sudah terinstal. Perangkat tanpa Google Play Services (AOSP murni) tidak didukung.
+
+### iOS
+
+| Requirement | Minimum |
+|-------------|---------|
+| **iOS** | `15.0` |
+| **Swift** | `5.1` |
+| **Xcode** | `15.0+` |
+| `TensorFlowLiteSwift` (via CocoaPods) | sesuai versi plugin |
+| `TensorFlowLite` (via SPM) | `>= 2.14.0` |
+
+> ℹ️ Face detection menggunakan framework **Apple Vision** bawaan iOS — tidak memerlukan library eksternal tambahan.
 
 ---
 
@@ -21,38 +60,24 @@ npx cap sync
 
 ---
 
-## Setup Model
+## Model Files
 
-Plugin ini memerlukan **dua model TFLite**:
+Plugin menyertakan kedua model TFLite langsung di dalam package — **tidak perlu download manual**.
 
-### 1. Model Face Recognition (`mobile_face_net.tflite`)
-Model MobileFaceNet untuk ekstraksi embedding wajah.
+| Model | Platform | Ukuran | Fungsi |
+|-------|----------|--------|--------|
+| `mobile_face_net.tflite` | Android & iOS | ~5.0 MB | Face recognition (embedding 192-dim) |
+| `anti_spoof.tflite` | Android & iOS | ~5.7 MB | Anti-spoofing / Liveness detection |
 
-### 2. Model Anti-Spoofing (`anti_spoof.tflite`) ← **Baru!**
-Model MiniFASNet untuk deteksi liveness (wajah asli vs spoofing).
+### Cara kerja bundling otomatis
 
-**Download model anti-spoofing:**
-```
-https://github.com/minivision-ai/Silent-Face-Anti-Spoofing
-```
-Gunakan model versi TFLite (export ke `.tflite`) atau cari versi siap pakai di community releases.
+**Android** — Model disalin ke `android/src/main/assets/` dan dibaca via `AssetManager`.
 
----
+**iOS (Swift Package Manager)** — Model didaftarkan di `Package.swift` sebagai `.process("Resources/...")` dan diakses via `Bundle.module`.
 
-### Android — Letakkan model di Assets
+**iOS (CocoaPods)** — Model didaftarkan di `.podspec` sebagai `s.resources` dan diakses via `Bundle.main`.
 
-```
-android/app/src/main/assets/
-├── mobile_face_net.tflite   ← face recognition
-└── anti_spoof.tflite        ← anti-spoofing (BARU)
-```
-
-### iOS — Tambahkan model ke Xcode Bundle
-
-1. Buka Xcode → pilih target app
-2. Drag & drop `anti_spoof.tflite` ke dalam project
-3. Pastikan **"Add to targets"** dicentang
-4. Verifikasi di **Build Phases → Copy Bundle Resources** ada `anti_spoof.tflite`
+> ✅ Setelah `npx cap sync`, model siap digunakan tanpa konfigurasi tambahan.
 
 ---
 
@@ -75,16 +100,21 @@ android/app/src/main/assets/
 extractFaceFeature(options: { imageBase64: string; }) => Promise<{ embedding: number[]; }>
 ```
 
-Mengirim base64 gambar ke Native, mengembalikan array of numbers (embeddings)
+Mendeteksi wajah dari gambar dan mengekstrak embedding 192-dimensi menggunakan model MobileFaceNet.
 
-| Param         | Type                                  |
-| ------------- | ------------------------------------- |
-| **`options`** | <code>{ imageBase64: string; }</code> |
+| Param | Type | Keterangan |
+|-------|------|-----------|
+| `imageBase64` | `string` | Gambar dalam format Base64 (JPEG/PNG) |
 
-**Returns:** <code>Promise&lt;{ embedding: number[]; }&gt;</code>
+**Returns:** `Promise<{ embedding: number[] }>`
+
+| Return | Type | Keterangan |
+|--------|------|-----------|
+| `embedding` | `number[]` | Array 192 angka float yang merepresentasikan fitur wajah |
+
+**Error:** Reject jika tidak ada wajah terdeteksi atau gambar tidak valid.
 
 --------------------
-
 
 ### compareFaces(...)
 
@@ -92,17 +122,24 @@ Mengirim base64 gambar ke Native, mengembalikan array of numbers (embeddings)
 compareFaces(options: { vector1: number[]; vector2: number[]; }) => Promise<{ isMatch: boolean; score: number; similarityPercentage: number; }>
 ```
 
-Membandingkan dua embedding wajah menggunakan Cosine Similarity.
-Mengembalikan isMatch (threshold 0.75), score cosine, dan persentase kemiripan.
+Membandingkan dua embedding wajah menggunakan **Cosine Similarity**.
 
-| Param         | Type                                                   |
-| ------------- | ------------------------------------------------------ |
-| **`options`** | <code>{ vector1: number[]; vector2: number[]; }</code> |
+| Param | Type | Keterangan |
+|-------|------|-----------|
+| `vector1` | `number[]` | Embedding wajah pertama |
+| `vector2` | `number[]` | Embedding wajah kedua |
 
-**Returns:** <code>Promise&lt;{ isMatch: boolean; score: number; similarityPercentage: number; }&gt;</code>
+**Returns:**
+
+| Field | Type | Keterangan |
+|-------|------|-----------|
+| `isMatch` | `boolean` | `true` jika wajah sama (threshold: cosine > 0.75) |
+| `score` | `number` | Nilai Cosine Similarity: `-1.0` s/d `1.0` |
+| `similarityPercentage` | `number` | Persentase kemiripan: `0` s/d `100` |
+
+**Error:** Reject jika panjang vector berbeda atau vector bernilai nol.
 
 --------------------
-
 
 ### checkLiveness(...)
 
@@ -110,25 +147,31 @@ Mengembalikan isMatch (threshold 0.75), score cosine, dan persentase kemiripan.
 checkLiveness(options: { imageBase64: string; }) => Promise<{ isLive: boolean; score: number; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; }>
 ```
 
-Memeriksa apakah wajah dalam gambar adalah wajah asli (live) atau spoofing (foto cetak, layar HP, video, topeng).
+Memeriksa apakah wajah adalah **wajah asli (live)** atau **spoofing** (foto cetak, layar HP/tablet, video replay, topeng).
 
-Memerlukan model `anti_spoof.tflite` di folder assets (Android) atau bundle (iOS).
+Menggunakan model **MiniFASNetV1** yang berjalan sepenuhnya on-device.
 
-| Param         | Type                                  |
-| ------------- | ------------------------------------- |
-| **`options`** | <code>{ imageBase64: string; }</code> |
+| Param | Type | Keterangan |
+|-------|------|-----------|
+| `imageBase64` | `string` | Gambar dalam format Base64 (JPEG/PNG) |
 
 **Returns:**
+
 | Field | Type | Keterangan |
 |-------|------|-----------|
-| `isLive` | `boolean` | `true` = wajah asli, `false` = terdeteksi spoofing |
-| `score` | `number` | Skor liveness antara `0.0` (spoof) hingga `1.0` (live) |
+| `isLive` | `boolean` | `true` = wajah asli, `false` = spoofing terdeteksi |
+| `score` | `number` | Skor liveness: `0.0` (pasti spoof) s/d `1.0` (pasti live) |
 | `confidence` | `'HIGH' \| 'MEDIUM' \| 'LOW'` | Tingkat kepercayaan hasil deteksi |
 
 **Confidence levels:**
-- `HIGH` — score > 0.85 atau < 0.15 (hasil sangat yakin)
-- `MEDIUM` — score > 0.6 atau < 0.4
-- `LOW` — score antara 0.4–0.6 (ambang batas, perlu review manual)
+
+| Level | Kondisi | Arti |
+|-------|---------|------|
+| `HIGH` | score > 0.85 atau < 0.15 | Model sangat yakin |
+| `MEDIUM` | score > 0.6 atau < 0.4 | Model cukup yakin |
+| `LOW` | score antara 0.4 – 0.6 | Hasil ambigu, perlu review |
+
+**Error:** Reject jika tidak ada wajah terdeteksi atau gambar tidak valid.
 
 --------------------
 
@@ -138,24 +181,26 @@ Memerlukan model `anti_spoof.tflite` di folder assets (Android) atau bundle (iOS
 
 ## Contoh Penggunaan
 
-### Face Recognition + Liveness Check (dikombinasikan)
+### Verifikasi wajah dengan liveness check (direkomendasikan)
 
 ```typescript
 import { FaceRecognition } from 'capacitor-face-recognition-tflite';
 
 async function verifyFaceWithLiveness(imageBase64: string, storedEmbedding: number[]) {
-  // 1. Cek liveness terlebih dahulu
+  // Langkah 1: Cek liveness terlebih dahulu untuk mencegah spoofing
   const liveness = await FaceRecognition.checkLiveness({ imageBase64 });
 
   if (!liveness.isLive) {
-    throw new Error(`Spoofing terdeteksi! Score: ${liveness.score.toFixed(2)}, Confidence: ${liveness.confidence}`);
+    throw new Error(
+      `Spoofing terdeteksi! Score: ${liveness.score.toFixed(2)}, ` +
+      `Confidence: ${liveness.confidence}`
+    );
   }
 
-  console.log(`✅ Liveness OK — Score: ${liveness.score.toFixed(2)}, Confidence: ${liveness.confidence}`);
-
-  // 2. Baru ekstrak embedding dan bandingkan wajah
+  // Langkah 2: Ekstrak embedding wajah
   const { embedding } = await FaceRecognition.extractFaceFeature({ imageBase64 });
 
+  // Langkah 3: Bandingkan dengan embedding tersimpan
   const result = await FaceRecognition.compareFaces({
     vector1: embedding,
     vector2: storedEmbedding,
@@ -164,28 +209,65 @@ async function verifyFaceWithLiveness(imageBase64: string, storedEmbedding: numb
   return {
     isAuthenticated: result.isMatch,
     similarity: result.similarityPercentage,
-    isLive: liveness.isLive,
     livenessScore: liveness.score,
   };
 }
 ```
 
-### checkLiveness saja
+### Simpan wajah baru (enrollment)
 
 ```typescript
-const result = await FaceRecognition.checkLiveness({ imageBase64: myBase64Image });
+async function enrollFace(imageBase64: string): Promise<number[]> {
+  // Cek liveness sebelum menyimpan
+  const liveness = await FaceRecognition.checkLiveness({ imageBase64 });
+  if (!liveness.isLive) throw new Error('Wajah tidak terdeteksi sebagai live');
 
-console.log(result.isLive);       // true / false
-console.log(result.score);        // 0.0 – 1.0
-console.log(result.confidence);   // "HIGH" | "MEDIUM" | "LOW"
+  // Ekstrak dan simpan embedding
+  const { embedding } = await FaceRecognition.extractFaceFeature({ imageBase64 });
+  return embedding; // Simpan ke database / AsyncStorage
+}
+```
+
+### Hanya cek liveness
+
+```typescript
+const result = await FaceRecognition.checkLiveness({ imageBase64 });
+
+if (result.isLive) {
+  console.log(`✅ Live — Score: ${result.score.toFixed(2)}, Confidence: ${result.confidence}`);
+} else {
+  console.log(`❌ Spoof — Score: ${result.score.toFixed(2)}, Confidence: ${result.confidence}`);
+}
 ```
 
 ---
 
-## Threshold
+## Threshold & Konfigurasi
 
-### Anti-Spoofing
-Default threshold adalah `0.5`. Untuk aplikasi dengan keamanan tinggi, naikkan threshold di kode native:
+### Face Recognition — Cosine Similarity Threshold
+
+Default threshold adalah `0.75`. Sesuaikan sesuai kebutuhan keamanan:
+
+| Nilai | Penggunaan |
+|-------|-----------|
+| `0.70` | Toleran — cocok untuk aplikasi non-kritis |
+| `0.75` | **Default** — keseimbangan akurasi & kenyamanan |
+| `0.80` | Ketat — cocok untuk sistem absensi |
+| `0.85` | Sangat ketat — cocok untuk aplikasi keuangan |
+
+**Android** (`FaceRecognitionPlugin.java` baris ~195):
+```java
+boolean isMatch = cosineSimilarity > 0.75; // ubah nilai ini
+```
+
+**iOS** (`FaceRecognitionPlugin.swift` baris ~160):
+```swift
+let isMatch = cosineSimilarity > 0.75 // ubah nilai ini
+```
+
+### Liveness Detection — Score Threshold
+
+Default threshold adalah `0.5`. Naikkan untuk lebih ketat:
 
 **Android** (`FaceRecognitionPlugin.java`):
 ```java
@@ -197,5 +279,82 @@ private static final float LIVENESS_THRESHOLD = 0.6f; // lebih ketat
 private let livenessThreshold: Float = 0.6 // lebih ketat
 ```
 
-### Face Recognition
-Default threshold adalah `0.75` (Cosine Similarity).
+---
+
+## Cara Kerja Internal
+
+### Face Recognition Flow
+```
+imageBase64 → Bitmap → ML Kit Face Detection → Crop wajah
+→ Resize 112×112 → Normalize [-1,1] → MobileFaceNet TFLite
+→ Embedding 192-dim → Cosine Similarity
+```
+
+### Liveness Detection Flow
+```
+imageBase64 → Bitmap → ML Kit / Apple Vision → Crop wajah (+20% margin)
+→ Resize 80×80 → Normalize [-1,1] → MiniFASNetV1 TFLite
+→ Softmax [live, print_spoof, replay_spoof] → isLive (score[0] > 0.5)
+```
+
+### Model Specs
+
+| | Face Recognition | Anti-Spoofing |
+|-|-----------------|---------------|
+| **Model** | MobileFaceNet | MiniFASNetV1 |
+| **Input** | `[1, 112, 112, 3]` | `[1, 80, 80, 3]` |
+| **Output** | `[1, 192]` embedding | `[1, 3]` softmax |
+| **Normalisasi** | `(pixel/128.0) - 1.0` | `(pixel/128.0) - 1.0` |
+| **Format** | FLOAT32 | FLOAT32 |
+
+---
+
+## Troubleshooting
+
+### Android — Model tidak ditemukan
+```
+Error: Model TFLite gagal dimuat. Pastikan file 'mobile_face_net.tflite' ada di folder android/src/main/assets/
+```
+**Solusi:** Jalankan `npx cap sync` ulang.
+
+### Android — Tidak ada wajah terdeteksi
+- Pastikan gambar cukup terang dan wajah terlihat jelas
+- Pastikan wajah tidak terlalu kecil (minimal ~20% dari ukuran gambar)
+- ML Kit memerlukan Google Play Services — pastikan perangkat mendukung
+
+### iOS — Model tidak ditemukan
+```
+[FaceRecognitionPlugin] ERROR: File 'mobile_face_net.tflite' tidak ditemukan di bundle.
+```
+**Solusi:** Jalankan `npx cap sync`. Pastikan menggunakan **SPM** (Package.swift) atau **CocoaPods** (podspec) — tidak keduanya bersamaan.
+
+### Liveness score selalu rendah / tinggi
+- Pastikan gambar wajah cukup resolusi (minimal 200×200 px)
+- Gunakan gambar frontal (wajah menghadap kamera langsung)
+- Hindari kondisi pencahayaan yang sangat buruk
+
+---
+
+## Dependensi Native
+
+### Android
+```gradle
+implementation 'com.google.mlkit:face-detection:16.1.5'
+implementation 'org.tensorflow:tensorflow-lite:2.14.0'
+implementation 'org.tensorflow:tensorflow-lite-support:0.4.4'
+```
+
+### iOS (CocoaPods)
+```ruby
+pod 'TensorFlowLiteSwift'
+pod 'Capacitor'
+```
+
+### iOS (Swift Package Manager)
+Sudah terdaftar di `Package.swift` — tidak perlu konfigurasi tambahan.
+
+---
+
+## License
+
+MIT
