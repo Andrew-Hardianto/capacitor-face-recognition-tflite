@@ -21,7 +21,12 @@ let package = Package(
                 .product(name: "Cordova", package: "capacitor-swift-pm"),
                 .product(name: "TensorFlowLite", package: "tensorflow"),
             ],
-            path: "ios/Sources/FaceRecognitionPlugin"),
+            path: "ios/Sources/FaceRecognitionPlugin",
+            resources: [
+                // Model TFLite di-bundle otomatis ke dalam iOS app
+                .process("Resources/mobile_face_net.tflite"),
+                .process("Resources/anti_spoof.tflite"),
+            ]),
         .testTarget(
             name: "FaceRecognitionPluginTests",
             dependencies: ["FaceRecognitionPlugin"],

@@ -15,4 +15,9 @@ Pod::Spec.new do |s|
   s.dependency 'Capacitor'
   s.swift_version = '5.1'
   s.dependency 'TensorFlowLiteSwift'
+  # Model TFLite di-bundle ke dalam framework resource bundle
+  s.resources = [
+    'ios/Sources/FaceRecognitionPlugin/Resources/mobile_face_net.tflite',
+    'ios/Sources/FaceRecognitionPlugin/Resources/anti_spoof.tflite'
+  ]
 end

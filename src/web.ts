@@ -41,5 +41,13 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
 
     return { isMatch, score, similarityPercentage };
   }
-}
 
+  async checkLiveness(_options: { imageBase64: string }): Promise<{
+    isLive: boolean;
+    score: number;
+    confidence: 'HIGH' | 'MEDIUM' | 'LOW';
+  }> {
+    console.warn('checkLiveness (Anti-Spoofing) hanya berjalan di Android & iOS native.');
+    return { isLive: false, score: 0, confidence: 'LOW' };
+  }
+}

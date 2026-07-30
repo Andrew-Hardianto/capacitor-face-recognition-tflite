@@ -14,10 +14,11 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "extractFaceFeature", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "compareFaces", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "checkLiveness", returnType: CAPPluginReturnPromise),
     ]
 
     // ============================
-    // Konfigurasi
+    // Konfigurasi — Face Recognition
     // ============================
     // Nama file model tanpa ekstensi (harus ada di bundle: mobile_face_net.tflite)
     private let modelName = "mobile_face_net"
@@ -26,9 +27,38 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     // Ukuran output embedding
     private let embeddingSize = 128
 
-    // TFLite Interpreter (lazy agar dimuat sekali)
+    // ============================
+    // Konfigurasi — Anti-Spoofing (Liveness Detection)
+    // ============================
+    // Nama file model anti-spoofing tanpa ekstensi (harus ada di bundle: anti_spoof.tflite)
+    // Model: MiniFASNetV1 dari shubham0204/OnDevice-Face-Recognition-Android
+    // Source: https://github.com/shubham0204/OnDevice-Face-Recognition-Android
+    private let antiSpoofModelName = "anti_spoof"
+    // MiniFASNet menggunakan input 80x80 (bukan 128x128)
+    private let antiSpoofInputSize = 80
+    // Output model: 3 kelas softmax → [live_score, print_spoof_score, replay_spoof_score]
+    // Index 0 = live (wajah asli)
+    private let antiSpoofOutputSize = 3
+    // Threshold liveness: skor live (index 0) di atas ini dianggap Live
+    private let livenessThreshold: Float = 0.5
+
+    /// Menentukan bundle yang tepat untuk mencari model TFLite:
+    /// - Swift Package Manager (SPM): gunakan `Bundle.module` (bundle plugin itu sendiri)
+    /// - CocoaPods: gunakan `Bundle.main` (model dikopi ke app bundle)
+    private var modelBundle: Bundle {
+        // Bundle.module hanya tersedia ketika plugin dipakai via SPM
+        // Saat CocoaPods, Swift Package resources tidak tersedia — fallback ke Bundle.main
+        #if SWIFT_PACKAGE
+        return Bundle.module
+        #else
+        return Bundle.main
+        #endif
+    }
+
+    // TFLite Interpreter — Face Recognition (lazy agar dimuat sekali)
     private lazy var interpreter: Interpreter? = {
-        guard let modelPath = Bundle.main.path(forResource: modelName, ofType: "tflite") else {
+        // modelBundle otomatis memilih Bundle.module (SPM) atau Bundle.main (CocoaPods)
+        guard let modelPath = modelBundle.path(forResource: modelName, ofType: "tflite") else {
             print("[FaceRecognitionPlugin] ERROR: File '\(modelName).tflite' tidak ditemukan di bundle.")
             return nil
         }
@@ -38,6 +68,23 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             return interpreter
         } catch {
             print("[FaceRecognitionPlugin] ERROR: Gagal membuat Interpreter: \(error)")
+            return nil
+        }
+    }()
+
+    // TFLite Interpreter — Anti-Spoofing (lazy, nullable — tidak crash jika model tidak ada)
+    private lazy var antiSpoofInterpreter: Interpreter? = {
+        // modelBundle otomatis memilih Bundle.module (SPM) atau Bundle.main (CocoaPods)
+        guard let modelPath = modelBundle.path(forResource: antiSpoofModelName, ofType: "tflite") else {
+            print("[FaceRecognitionPlugin] INFO: File '\(antiSpoofModelName).tflite' tidak ditemukan di bundle. checkLiveness tidak akan tersedia.")
+            return nil
+        }
+        do {
+            let interpreter = try Interpreter(modelPath: modelPath)
+            try interpreter.allocateTensors()
+            return interpreter
+        } catch {
+            print("[FaceRecognitionPlugin] ERROR: Gagal membuat antiSpoofInterpreter: \(error)")
             return nil
         }
     }()
@@ -105,7 +152,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             }
 
             // 6. Konversi UIImage ke Data input TFLite (normalisasi ke [-1, 1])
-            guard let inputData = self.imageToInputData(scaledImage) else {
+            guard let inputData = self.imageToInputData(scaledImage, size: self.inputSize) else {
                 call.reject("Gagal mengkonversi gambar ke format TFLite input")
                 return
             }
@@ -185,15 +232,160 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
+    // checkLiveness (Anti-Spoofing)
+    // ============================
+    /// Memeriksa apakah wajah dalam gambar adalah wajah asli (live) atau spoofing.
+    ///
+    /// Alur kerja:
+    ///   1. Decode Base64 → UIImage
+    ///   2. Apple Vision → deteksi wajah → crop region wajah (dengan margin)
+    ///   3. Resize ke 128×128 (input MiniFASNet)
+    ///   4. TFLite inference model anti-spoofing
+    ///   5. Output: [spoof_score, live_score] → softmax → livenessScore
+    ///   6. Return isLive, score, confidence ke JavaScript
+    ///
+    /// Memerlukan file 'anti_spoof.tflite' di bundle iOS.
+    /// Download: https://github.com/minivision-ai/Silent-Face-Anti-Spoofing
+    @objc func checkLiveness(_ call: CAPPluginCall) {
+        // Periksa apakah model anti-spoofing tersedia
+        guard let antiSpoofInterpreter = antiSpoofInterpreter else {
+            call.reject(
+                "Model anti-spoofing tidak ditemukan. " +
+                "Letakkan file '\(antiSpoofModelName).tflite' di bundle iOS Xcode project. " +
+                "Download model dari: https://github.com/minivision-ai/Silent-Face-Anti-Spoofing"
+            )
+            return
+        }
+
+        // 1. Decode Base64 ke UIImage
+        guard let imageBase64 = call.getString("imageBase64"),
+              let data = Data(base64Encoded: imageBase64, options: .ignoreUnknownCharacters),
+              let image = UIImage(data: data),
+              let cgImage = image.cgImage
+        else {
+            call.reject("Gagal decode Base64 menjadi gambar")
+            return
+        }
+
+        // 2. Deteksi wajah menggunakan Apple Vision
+        let request = VNDetectFaceRectanglesRequest { [weak self] (req, error) in
+            guard let self = self else { return }
+
+            if let err = error {
+                call.reject("Vision gagal mendeteksi: \(err.localizedDescription)")
+                return
+            }
+
+            guard let results = req.results as? [VNFaceObservation],
+                  let face = results.first
+            else {
+                call.reject("Tidak ada wajah yang terdeteksi untuk pemeriksaan liveness")
+                return
+            }
+
+            // 3. Konversi bounding box Vision (koordinat dari kiri bawah → kiri atas)
+            let imgWidth = image.size.width
+            let imgHeight = image.size.height
+            let bb = face.boundingBox
+
+            // Tambahkan margin 20% agar konteks kulit sekitar wajah ikut tertangkap
+            // (membantu model mendeteksi tepi foto / layar)
+            let marginW = bb.size.width * 0.2
+            let marginH = bb.size.height * 0.2
+
+            let faceRect = CGRect(
+                x: max(0, bb.origin.x * imgWidth - marginW * imgWidth),
+                y: max(0, (1 - bb.origin.y - bb.size.height) * imgHeight - marginH * imgHeight),
+                width: min(imgWidth, (bb.size.width + 2 * marginW) * imgWidth),
+                height: min(imgHeight, (bb.size.height + 2 * marginH) * imgHeight)
+            )
+
+            // 4. Crop wajah (dengan margin)
+            guard let croppedCgImage = cgImage.cropping(to: faceRect) else {
+                call.reject("Gagal memotong gambar wajah untuk liveness check")
+                return
+            }
+
+            // 5. Resize ke antiSpoofInputSize x antiSpoofInputSize (80x80)
+            let targetSize = CGSize(width: self.antiSpoofInputSize, height: self.antiSpoofInputSize)
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+            let scaledImage = renderer.image { _ in
+                UIImage(cgImage: croppedCgImage).draw(in: CGRect(origin: .zero, size: targetSize))
+            }
+
+            // 6. Konversi UIImage ke Data input TFLite (normalisasi ke [-1, 1])
+            guard let inputData = self.imageToInputData(scaledImage, size: self.antiSpoofInputSize) else {
+                call.reject("Gagal mengkonversi gambar ke format TFLite input anti-spoofing")
+                return
+            }
+
+            // 7. Set input tensor & jalankan inference
+            do {
+                try antiSpoofInterpreter.copy(inputData, toInputAt: 0)
+                try antiSpoofInterpreter.invoke()
+
+                // 8. Ambil output tensor — shape: [1, 3] → [live_score, print_spoof, replay_spoof]
+                let outputTensor = try antiSpoofInterpreter.output(at: 0)
+                let outputData = outputTensor.data
+
+                // 9. Konversi output bytes ke [Float]
+                var scores = [Float](repeating: 0, count: 3)
+                _ = scores.withUnsafeMutableBytes { ptr in
+                    outputData.copyBytes(to: ptr)
+                }
+
+                // 10. Output model sudah dalam bentuk softmax probability
+                // Index 0 = live, Index 1 = print spoof, Index 2 = replay spoof
+                let livenessScore = scores[0]
+
+                // 11. Tentukan apakah live berdasarkan threshold
+                let isLive = livenessScore > self.livenessThreshold
+
+                // 12. Tentukan tingkat kepercayaan
+                let confidence: String
+                if livenessScore > 0.85 || livenessScore < 0.15 {
+                    confidence = "HIGH"
+                } else if livenessScore > 0.6 || livenessScore < 0.4 {
+                    confidence = "MEDIUM"
+                } else {
+                    confidence = "LOW"
+                }
+
+                // 13. Kirim hasil ke JavaScript
+                call.resolve([
+                    "isLive": isLive,
+                    "score": livenessScore,
+                    "confidence": confidence,
+                ])
+            } catch {
+                call.reject("TFLite anti-spoofing inference gagal: \(error.localizedDescription)")
+            }
+        }
+
+        // Eksekusi Vision Request
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            call.reject("Gagal menjalankan Vision Request untuk liveness: \(error.localizedDescription)")
+        }
+    }
+
+    // ============================
     // Helper: UIImage → ByteData TFLite
     // ============================
-    /// Konversi UIImage 112x112 ke Data berformat [R, G, B, R, G, B, ...]
+    /// Konversi UIImage ke Data berformat [R, G, B, R, G, B, ...]
     /// dengan normalisasi ke [-1, 1]: normalized = (pixel / 128.0) - 1.0
-    private func imageToInputData(_ image: UIImage) -> Data? {
+    ///
+    /// - Parameter image: UIImage yang sudah di-resize ke ukuran yang sesuai
+    /// - Parameter size: Ukuran input model (112 untuk face recognition, 128 untuk anti-spoofing)
+    private func imageToInputData(_ image: UIImage, size: Int) -> Data? {
         guard let cgImage = image.cgImage else { return nil }
 
-        let width = inputSize
-        let height = inputSize
+        let width = size
+        let height = size
         let bytesPerPixel = 4 // RGBA
         let bytesPerRow = width * bytesPerPixel
         let totalBytes = height * bytesPerRow
