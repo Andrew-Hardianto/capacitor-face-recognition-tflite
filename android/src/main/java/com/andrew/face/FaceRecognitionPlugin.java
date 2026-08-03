@@ -368,8 +368,8 @@ public class FaceRecognitionPlugin extends Plugin {
                         Bitmap scaledFace = Bitmap.createScaledBitmap(
                                 croppedFace, ANTI_SPOOF_INPUT_SIZE, ANTI_SPOOF_INPUT_SIZE, true);
 
-                        // 6. Konversi ke ByteBuffer — normalisasi ke [-1, 1]
-                        ByteBuffer inputBuffer = bitmapToByteBuffer(scaledFace, ANTI_SPOOF_INPUT_SIZE);
+                        // 6. Konversi ke ByteBuffer — normalisasi ke [0, 1] (MiniFASNet standard)
+                        ByteBuffer inputBuffer = bitmapToByteBufferAntiSpoof(scaledFace, ANTI_SPOOF_INPUT_SIZE);
 
                         // 7. Output model MiniFASNet: [1, 3] → [live_score, print_spoof, replay_spoof]
                         float[][] outputArray = new float[1][ANTI_SPOOF_OUTPUT_SIZE];
@@ -377,13 +377,14 @@ public class FaceRecognitionPlugin extends Plugin {
                         // 8. Jalankan inference
                         antiSpoofInterpreter.run(inputBuffer, outputArray);
 
-                        // 9. Output sudah dalam bentuk softmax probability dari model
+                        // 9. Terapkan softmax manual karena model mungkin output raw logits
                         // Index 0 = live, Index 1 = print spoof, Index 2 = replay spoof
-                        float liveScore       = outputArray[0][0];
-                        float printSpoofScore = outputArray[0][1];
-                        float replaySpoofScore= outputArray[0][2];
+                        float[] probs = softmax(outputArray[0]);
+                        float liveScore       = probs[0];
+                        float printSpoofScore = probs[1];
+                        float replaySpoofScore= probs[2];
 
-                        // 10. Skor liveness langsung dari output softmax (sudah dinormalisasi 0-1)
+                        // 10. Skor liveness dari output softmax (sudah dinormalisasi 0-1)
                         float livenessScore = liveScore;
 
                         // 11. Tentukan apakah live berdasarkan threshold
@@ -432,6 +433,10 @@ public class FaceRecognitionPlugin extends Plugin {
      * @param bitmap  Bitmap yang sudah di-resize ke ukuran yang sesuai
      * @param size    Ukuran input model (112 untuk face recognition, 128 untuk anti-spoofing)
      */
+    // ============================
+    // Preprocessing — Face Recognition (MobileFaceNet)
+    // Normalisasi ke [-1, 1]
+    // ============================
     private ByteBuffer bitmapToByteBuffer(Bitmap bitmap, int size) {
         // Alokasi buffer: 1 batch * tinggi * lebar * channel * bytes_per_float
         int bufferSize = 1 * size * size * PIXEL_CHANNELS * BYTES_PER_FLOAT;
@@ -449,12 +454,58 @@ public class FaceRecognitionPlugin extends Plugin {
             int g = (pixelValue >> 8) & 0xFF;
             int b = pixelValue & 0xFF;
 
-            // Normalisasi ke [-1, 1] sesuai format input MobileFaceNet & MiniFASNet
+            // Normalisasi ke [-1, 1] sesuai format input MobileFaceNet
             byteBuffer.putFloat((r / 128.0f) - 1.0f);
             byteBuffer.putFloat((g / 128.0f) - 1.0f);
             byteBuffer.putFloat((b / 128.0f) - 1.0f);
         }
 
         return byteBuffer;
+    }
+
+    // ============================
+    // Preprocessing — Anti-Spoofing (MiniFASNet)
+    // Normalisasi ke [0, 1] — sesuai training MiniFASNet
+    // ============================
+    private ByteBuffer bitmapToByteBufferAntiSpoof(Bitmap bitmap, int size) {
+        int bufferSize = 1 * size * size * PIXEL_CHANNELS * BYTES_PER_FLOAT;
+        ByteBuffer byteBuffer = ByteBuffer.allocateDirect(bufferSize);
+        byteBuffer.order(ByteOrder.nativeOrder());
+        byteBuffer.rewind();
+
+        int[] pixels = new int[size * size];
+        bitmap.getPixels(pixels, 0, size, 0, 0, size, size);
+
+        for (int pixelValue : pixels) {
+            int r = (pixelValue >> 16) & 0xFF;
+            int g = (pixelValue >> 8) & 0xFF;
+            int b = pixelValue & 0xFF;
+
+            // MiniFASNet: normalisasi ke [0, 1] → (pixel / 255.0)
+            byteBuffer.putFloat(r / 255.0f);
+            byteBuffer.putFloat(g / 255.0f);
+            byteBuffer.putFloat(b / 255.0f);
+        }
+
+        return byteBuffer;
+    }
+
+    // ============================
+    // Softmax — konversi raw logits ke probability
+    // ============================
+    private float[] softmax(float[] logits) {
+        float max = logits[0];
+        for (float v : logits) if (v > max) max = v;
+
+        float sum = 0f;
+        float[] exp = new float[logits.length];
+        for (int i = 0; i < logits.length; i++) {
+            exp[i] = (float) Math.exp(logits[i] - max); // numerically stable
+            sum += exp[i];
+        }
+        for (int i = 0; i < exp.length; i++) {
+            exp[i] /= sum;
+        }
+        return exp;
     }
 }

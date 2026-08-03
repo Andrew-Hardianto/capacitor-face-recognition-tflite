@@ -379,8 +379,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                 UIImage(cgImage: croppedCgImage).draw(in: CGRect(origin: .zero, size: targetSize))
             }
 
-            // 6. Konversi UIImage ke Data input TFLite (normalisasi ke [-1, 1])
-            guard let inputData = self.imageToInputData(scaledImage, size: self.antiSpoofInputSize) else {
+            // 6. Konversi UIImage ke Data input TFLite (normalisasi ke [0, 1] — MiniFASNet standard)
+            guard let inputData = self.imageToInputDataAntiSpoof(scaledImage, size: self.antiSpoofInputSize) else {
                 call.reject("Gagal mengkonversi gambar ke format TFLite input anti-spoofing")
                 return
             }
@@ -400,9 +400,10 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                     outputData.copyBytes(to: ptr)
                 }
 
-                // 10. Output model sudah dalam bentuk softmax probability
+                // 10. Terapkan softmax manual karena model mungkin output raw logits
                 // Index 0 = live, Index 1 = print spoof, Index 2 = replay spoof
-                let livenessScore = scores[0]
+                let probs = self.softmax(scores)
+                let livenessScore = probs[0]
 
                 // 11. Tentukan apakah live berdasarkan threshold
                 let isLive = livenessScore > self.livenessThreshold
@@ -438,13 +439,14 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
-    // Helper: UIImage → ByteData TFLite
+    // Helper: UIImage → ByteData TFLite — Face Recognition (MobileFaceNet)
+    // Normalisasi ke [-1, 1]
     // ============================
     /// Konversi UIImage ke Data berformat [R, G, B, R, G, B, ...]
     /// dengan normalisasi ke [-1, 1]: normalized = (pixel / 128.0) - 1.0
     ///
     /// - Parameter image: UIImage yang sudah di-resize ke ukuran yang sesuai
-    /// - Parameter size: Ukuran input model (112 untuk face recognition, 128 untuk anti-spoofing)
+    /// - Parameter size: Ukuran input model (112 untuk face recognition)
     private func imageToInputData(_ image: UIImage, size: Int) -> Data? {
         guard let cgImage = image.cgImage else { return nil }
 
@@ -486,5 +488,62 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         return floatBuffer.withUnsafeBytes { Data($0) }
+    }
+
+    // ============================
+    // Helper: UIImage → ByteData TFLite — Anti-Spoofing (MiniFASNet)
+    // Normalisasi ke [0, 1] — sesuai training MiniFASNet
+    // ============================
+    private func imageToInputDataAntiSpoof(_ image: UIImage, size: Int) -> Data? {
+        guard let cgImage = image.cgImage else { return nil }
+
+        let width = size
+        let height = size
+        let bytesPerPixel = 4 // RGBA
+        let bytesPerRow = width * bytesPerPixel
+        let totalBytes = height * bytesPerRow
+
+        var rawPixels = [UInt8](repeating: 0, count: totalBytes)
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: &rawPixels,
+                  width: width,
+                  height: height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: bytesPerRow,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+              )
+        else { return nil }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        // MiniFASNet: normalisasi ke [0, 1] → pixel / 255.0
+        var floatBuffer = [Float](repeating: 0, count: width * height * 3)
+        var floatIndex = 0
+
+        for i in stride(from: 0, to: totalBytes, by: bytesPerPixel) {
+            let r = Float(rawPixels[i])
+            let g = Float(rawPixels[i + 1])
+            let b = Float(rawPixels[i + 2])
+
+            floatBuffer[floatIndex]     = r / 255.0
+            floatBuffer[floatIndex + 1] = g / 255.0
+            floatBuffer[floatIndex + 2] = b / 255.0
+            floatIndex += 3
+        }
+
+        return floatBuffer.withUnsafeBytes { Data($0) }
+    }
+
+    // ============================
+    // Softmax — konversi raw logits ke probability
+    // ============================
+    private func softmax(_ logits: [Float]) -> [Float] {
+        let maxVal = logits.max() ?? 0
+        let exps = logits.map { exp($0 - maxVal) }
+        let sumExps = exps.reduce(0, +)
+        return exps.map { $0 / sumExps }
     }
 }
