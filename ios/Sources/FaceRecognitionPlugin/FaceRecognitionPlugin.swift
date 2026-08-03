@@ -401,9 +401,10 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
 
                 // 10. Terapkan softmax manual karena model mungkin output raw logits
-                // Index 0 = live, Index 1 = print spoof, Index 2 = replay spoof
+                // Original repo (minivision-ai): Label 1 adalah Real Face
+                // Index 0 = spoof, Index 1 = live, Index 2 = spoof
                 let probs = self.softmax(scores)
-                let livenessScore = probs[0]
+                let livenessScore = probs[1]
 
                 // 11. Tentukan apakah live berdasarkan threshold
                 let isLive = livenessScore > self.livenessThreshold

@@ -378,11 +378,12 @@ public class FaceRecognitionPlugin extends Plugin {
                         antiSpoofInterpreter.run(inputBuffer, outputArray);
 
                         // 9. Terapkan softmax manual karena model mungkin output raw logits
-                        // Index 0 = live, Index 1 = print spoof, Index 2 = replay spoof
+                        // Original repo (minivision-ai): Label 1 adalah Real Face
+                        // Index 0 = spoof, Index 1 = live, Index 2 = spoof
                         float[] probs = softmax(outputArray[0]);
-                        float liveScore       = probs[0];
-                        float printSpoofScore = probs[1];
-                        float replaySpoofScore= probs[2];
+                        float spoofScore1     = probs[0];
+                        float liveScore       = probs[1];
+                        float spoofScore2     = probs[2];
 
                         // 10. Skor liveness dari output softmax (sudah dinormalisasi 0-1)
                         float livenessScore = liveScore;
