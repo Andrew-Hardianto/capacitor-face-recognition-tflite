@@ -465,7 +465,7 @@ public class FaceRecognitionPlugin extends Plugin {
 
     // ============================
     // Preprocessing — Anti-Spoofing (MiniFASNet)
-    // Normalisasi ke [0, 1] — sesuai training MiniFASNet
+    // Normalisasi ke [0, 1] + channel order BGR (MiniFASNet dilatih dengan OpenCV = BGR)
     // ============================
     private ByteBuffer bitmapToByteBufferAntiSpoof(Bitmap bitmap, int size) {
         int bufferSize = 1 * size * size * PIXEL_CHANNELS * BYTES_PER_FLOAT;
@@ -481,10 +481,11 @@ public class FaceRecognitionPlugin extends Plugin {
             int g = (pixelValue >> 8) & 0xFF;
             int b = pixelValue & 0xFF;
 
-            // MiniFASNet: normalisasi ke [0, 1] → (pixel / 255.0)
-            byteBuffer.putFloat(r / 255.0f);
-            byteBuffer.putFloat(g / 255.0f);
+            // MiniFASNet dilatih dengan OpenCV (BGR), normalisasi [0, 1]
+            // Urutan channel: B, G, R (BUKAN R, G, B)
             byteBuffer.putFloat(b / 255.0f);
+            byteBuffer.putFloat(g / 255.0f);
+            byteBuffer.putFloat(r / 255.0f);
         }
 
         return byteBuffer;
