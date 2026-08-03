@@ -482,11 +482,11 @@ public class FaceRecognitionPlugin extends Plugin {
             int g = (pixelValue >> 8) & 0xFF;
             int b = pixelValue & 0xFF;
 
-            // MiniFASNet dilatih dengan OpenCV (BGR), normalisasi [0, 1]
+            // MiniFASNet dilatih dengan OpenCV (BGR), normalisasi HILANGKAN (model asli pakai [0, 255])
             // Urutan channel: B, G, R (BUKAN R, G, B)
-            byteBuffer.putFloat(b / 255.0f);
-            byteBuffer.putFloat(g / 255.0f);
-            byteBuffer.putFloat(r / 255.0f);
+            byteBuffer.putFloat((float) b);
+            byteBuffer.putFloat((float) g);
+            byteBuffer.putFloat((float) r);
         }
 
         return byteBuffer;

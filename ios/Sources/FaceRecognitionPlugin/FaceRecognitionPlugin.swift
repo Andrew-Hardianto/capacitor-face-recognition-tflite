@@ -520,7 +520,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
 
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
 
-        // MiniFASNet dilatih dengan OpenCV (BGR), normalisasi [0, 1]
+        // MiniFASNet dilatih dengan OpenCV (BGR), normalisasi HILANGKAN (model asli pakai [0, 255])
         // Urutan channel: B, G, R (BUKAN R, G, B)
         var floatBuffer = [Float](repeating: 0, count: width * height * 3)
         var floatIndex = 0
@@ -530,9 +530,9 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             let g = Float(rawPixels[i + 1])
             let b = Float(rawPixels[i + 2])
 
-            floatBuffer[floatIndex]     = b / 255.0
-            floatBuffer[floatIndex + 1] = g / 255.0
-            floatBuffer[floatIndex + 2] = r / 255.0
+            floatBuffer[floatIndex]     = b
+            floatBuffer[floatIndex + 1] = g
+            floatBuffer[floatIndex + 2] = r
             floatIndex += 3
         }
 
