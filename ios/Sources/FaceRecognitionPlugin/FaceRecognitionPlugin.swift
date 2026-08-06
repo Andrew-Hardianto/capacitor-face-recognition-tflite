@@ -537,10 +537,12 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                 outputData.copyBytes(to: ptr)
             }
 
-            // Model TFLite biasanya sudah memiliki layer Softmax bawaan di akhir (output 0.0 - 1.0).
-            // JANGAN lakukan softmax manual lagi, langsung ambil probabilitas aslinya.
+            // Model MiniFASNet ini ternyata mengeluarkan raw logits, bukan probabilitas.
+            // Kita HARUS melakukan softmax agar rentang nilainya menjadi 0.0 - 1.0.
+            let probs = softmax(scores)
+            
             // Index 1 = Wajah Asli (Real Face)
-            return scores[1]
+            return probs[1]
 
         } catch {
             print("[AntiSpoof] Inference error (scale \(scaleFactor)): \(error)")

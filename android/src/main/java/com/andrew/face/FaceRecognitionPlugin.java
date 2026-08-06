@@ -466,10 +466,12 @@ public class FaceRecognitionPlugin extends Plugin {
             // Jalankan inference
             antiSpoofInterpreter.run(inputBuffer, outputArray);
 
-            // Model TFLite biasanya sudah memiliki layer Softmax bawaan di akhir (output 0.0 - 1.0).
-            // JANGAN lakukan softmax manual lagi, langsung ambil probabilitas aslinya.
+            // Model MiniFASNet ini ternyata mengeluarkan raw logits, bukan probabilitas.
+            // Kita HARUS melakukan softmax agar rentang nilainya menjadi 0.0 - 1.0.
+            float[] probs = softmax(outputArray[0]);
+            
             // Index 1 = Wajah Asli (Real Face)
-            return outputArray[0][1];
+            return probs[1];
 
         } catch (Exception e) {
             android.util.Log.e("AntiSpoof", "Inference error (scale " + scaleFactor + "): " + e.getMessage());
