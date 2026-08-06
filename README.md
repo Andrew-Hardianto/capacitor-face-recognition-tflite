@@ -140,7 +140,8 @@ checkLiveness(options: { imageBase64: string; }) => Promise<{ isLive: boolean; s
 Memeriksa apakah wajah dalam gambar adalah wajah asli (live) atau spoofing
 (foto cetak, layar HP, video, topeng).
 
-Memerlukan model `anti_spoof.tflite` di folder assets (Android) atau bundle (iOS).
+Implementasi: Multi-Scale MiniFASNet — inference dua kali (scale 1.0x dan 2.7x),
+hasilnya di-average. Threshold 0.75 untuk HRIS production.
 
 | Param         | Type                                  |
 | ------------- | ------------------------------------- |
@@ -158,7 +159,10 @@ detectFaces(options: { imageBase64: string; }) => Promise<{ count: number; faces
 ```
 
 Mendeteksi semua wajah dalam gambar tanpa melakukan recognition.
-Berguna untuk validasi awal: pastikan tepat 1 wajah sebelum proses berikutnya.
+Berguna untuk validasi awal dan blink challenge di layer JS (HRIS production).
+
+iOS: menggunakan VNDetectFaceLandmarksRequest untuk eye landmark (EAR-based).
+Android: menggunakan ML Kit dengan CLASSIFICATION_MODE_ALL.
 
 | Param         | Type                                  |
 | ------------- | ------------------------------------- |

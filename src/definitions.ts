@@ -18,12 +18,13 @@ export interface FaceRecognitionPlugin {
    * Memeriksa apakah wajah dalam gambar adalah wajah asli (live) atau spoofing
    * (foto cetak, layar HP, video, topeng).
    *
-   * Memerlukan model `anti_spoof.tflite` di folder assets (Android) atau bundle (iOS).
+   * Implementasi: Multi-Scale MiniFASNet — inference dua kali (scale 1.0x dan 2.7x),
+   * hasilnya di-average. Threshold 0.75 untuk HRIS production.
    *
    * @param options.imageBase64 - Gambar dalam format Base64
    * @returns isLive - true jika wajah asli, false jika terdeteksi spoofing
-   * @returns score - Skor liveness antara 0.0 (spoof) hingga 1.0 (live)
-   * @returns confidence - Tingkat kepercayaan: "HIGH" (>0.85), "MEDIUM" (0.6–0.85), "LOW" (<0.6)
+   * @returns score  - Skor liveness antara 0.0 (spoof) hingga 1.0 (live)
+   * @returns confidence - "HIGH" (>0.85 atau <0.15), "MEDIUM" (0.6–0.85 atau 0.15–0.4), "LOW" (0.4–0.6)
    */
   checkLiveness(options: { imageBase64: string }): Promise<{
     isLive: boolean;
@@ -33,11 +34,14 @@ export interface FaceRecognitionPlugin {
 
   /**
    * Mendeteksi semua wajah dalam gambar tanpa melakukan recognition.
-   * Berguna untuk validasi awal: pastikan tepat 1 wajah sebelum proses berikutnya.
+   * Berguna untuk validasi awal dan blink challenge di layer JS (HRIS production).
+   *
+   * iOS: menggunakan VNDetectFaceLandmarksRequest untuk eye landmark (EAR-based).
+   * Android: menggunakan ML Kit dengan CLASSIFICATION_MODE_ALL.
    *
    * @param options.imageBase64 - Gambar dalam format Base64
    * @returns count - Jumlah wajah yang terdeteksi
-   * @returns faces - Array bounding box tiap wajah: { x, y, width, height }
+   * @returns faces - Array data tiap wajah
    */
   detectFaces(options: { imageBase64: string }): Promise<{
     count: number;
@@ -46,9 +50,13 @@ export interface FaceRecognitionPlugin {
       y: number;
       width: number;
       height: number;
+      /** Rotasi kepala kiri-kanan dalam derajat (Android: ML Kit, iOS: selalu 0) */
       headEulerAngleY: number;
+      /** Rotasi kepala miring dalam derajat */
       headEulerAngleZ: number;
+      /** Probabilitas mata kiri terbuka (0.0 = tutup, 1.0 = buka). Null jika tidak dapat dihitung. */
       leftEyeOpenProbability: number | null;
+      /** Probabilitas mata kanan terbuka (0.0 = tutup, 1.0 = buka). Null jika tidak dapat dihitung. */
       rightEyeOpenProbability: number | null;
     }>;
   }>;

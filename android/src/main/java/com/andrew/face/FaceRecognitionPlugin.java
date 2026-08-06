@@ -53,13 +53,18 @@ public class FaceRecognitionPlugin extends Plugin {
     // Output model: 3 kelas softmax → [live_score, print_spoof_score, replay_spoof_score]
     // Index 0 = live (wajah asli)
     private static final int ANTI_SPOOF_OUTPUT_SIZE = 3;
-    // Threshold liveness: skor live index-0 di atas ini dianggap Live (wajah asli)
-    // Nilai default: 0.5 — bisa dinaikkan ke 0.6 untuk lebih ketat
-    private static final float LIVENESS_THRESHOLD = 0.5f;
+    // Threshold liveness (HRIS production): skor live di atas ini dianggap Live
+    // Dinaikkan ke 0.75 untuk mencegah foto/replay di lingkungan HRIS
+    private static final float LIVENESS_THRESHOLD = 0.75f;
+    // Scale factor untuk multi-scale inference (sesuai paper MiniFASNet)
+    // Scale 1.0 = crop ketat, Scale 2.7 = crop lebar (tangkap artefak tepi foto/layar)
+    private static final float[] ANTI_SPOOF_SCALES = {1.0f, 2.7f};
 
-    // ML Kit Face Detector
+    // ML Kit Face Detector — aktifkan classification dan landmark untuk eye open probability
     private final FaceDetectorOptions options = new FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .build();
     private final FaceDetector detector = FaceDetection.getClient(options);
 
@@ -264,7 +269,7 @@ public class FaceRecognitionPlugin extends Plugin {
             detector.process(image)
                 .addOnSuccessListener(faces -> {
                     try {
-                        // 3. Susun array bounding box untuk setiap wajah
+                        // 3. Susun array bounding box + eye probability + head angle
                         JSONArray facesArray = new JSONArray();
                         for (Face face : faces) {
                             Rect bounds = face.getBoundingBox();
@@ -280,6 +285,18 @@ public class FaceRecognitionPlugin extends Plugin {
                             faceObj.put("y", y);
                             faceObj.put("width", width);
                             faceObj.put("height", height);
+
+                            // Head euler angles (rotasi kepala)
+                            faceObj.put("headEulerAngleY", face.getHeadEulerAngleY()); // kiri-kanan
+                            faceObj.put("headEulerAngleZ", face.getHeadEulerAngleZ()); // miring
+
+                            // Eye open probability (0.0 = tutup, 1.0 = buka penuh)
+                            // Tersedia karena CLASSIFICATION_MODE_ALL diaktifkan
+                            Float leftEyeProb  = face.getLeftEyeOpenProbability();
+                            Float rightEyeProb = face.getRightEyeOpenProbability();
+                            if (leftEyeProb  != null) faceObj.put("leftEyeOpenProbability",  leftEyeProb.doubleValue());
+                            if (rightEyeProb != null) faceObj.put("rightEyeOpenProbability", rightEyeProb.doubleValue());
+
                             facesArray.put(faceObj);
                         }
 
@@ -349,49 +366,32 @@ public class FaceRecognitionPlugin extends Plugin {
                         Face face = faces.get(0);
                         Rect bounds = face.getBoundingBox();
 
-                        // Margin tambahan agar konteks kulit sekitar wajah ikut tertangkap
-                        // (membantu model anti-spoofing mendeteksi tepi foto/layar)
-                        int marginW = (int) (bounds.width() * 0.2f);
-                        int marginH = (int) (bounds.height() * 0.2f);
+                        // 4. Multi-Scale Inference: jalankan anti-spoof untuk setiap scale
+                        float scoreSum = 0f;
+                        int scaleCount = 0;
 
-                        int left   = Math.max(0, bounds.left - marginW);
-                        int top    = Math.max(0, bounds.top - marginH);
-                        int right  = Math.min(bitmap.getWidth(), bounds.right + marginW);
-                        int bottom = Math.min(bitmap.getHeight(), bounds.bottom + marginH);
-                        int width  = right - left;
-                        int height = bottom - top;
+                        for (float scaleFactor : ANTI_SPOOF_SCALES) {
+                            float score = runAntiSpoofInference(bitmap, bounds, scaleFactor);
+                            if (score >= 0) {  // -1 berarti gagal
+                                scoreSum += score;
+                                scaleCount++;
+                                android.util.Log.d("AntiSpoof", "Scale " + scaleFactor + " score: " + score);
+                            }
+                        }
 
-                        // 4. Crop wajah (dengan margin)
-                        Bitmap croppedFace = Bitmap.createBitmap(bitmap, left, top, width, height);
+                        if (scaleCount == 0) {
+                            call.reject("Gagal menjalankan anti-spoof inference di semua scale");
+                            return;
+                        }
 
-                        // 5. Resize ke ANTI_SPOOF_INPUT_SIZE x ANTI_SPOOF_INPUT_SIZE (80x80)
-                        Bitmap scaledFace = Bitmap.createScaledBitmap(
-                                croppedFace, ANTI_SPOOF_INPUT_SIZE, ANTI_SPOOF_INPUT_SIZE, true);
+                        // 5. Average semua score dari berbagai scale
+                        float livenessScore = scoreSum / scaleCount;
+                        android.util.Log.d("AntiSpoof", "Final avg score: " + livenessScore);
 
-                        // 6. Konversi ke ByteBuffer — normalisasi ke [0, 1] (MiniFASNet standard)
-                        ByteBuffer inputBuffer = bitmapToByteBufferAntiSpoof(scaledFace, ANTI_SPOOF_INPUT_SIZE);
-
-                        // 7. Output model MiniFASNet: [1, 3] → [live_score, print_spoof, replay_spoof]
-                        float[][] outputArray = new float[1][ANTI_SPOOF_OUTPUT_SIZE];
-
-                        // 8. Jalankan inference
-                        antiSpoofInterpreter.run(inputBuffer, outputArray);
-
-                        // 9. Terapkan softmax manual karena model mungkin output raw logits
-                        // Original repo (minivision-ai): Label 1 adalah Real Face
-                        // Index 0 = spoof, Index 1 = live, Index 2 = spoof
-                        float[] probs = softmax(outputArray[0]);
-                        float spoofScore1     = probs[0];
-                        float liveScore       = probs[1];
-                        float spoofScore2     = probs[2];
-
-                        // 10. Skor liveness dari output softmax (sudah dinormalisasi 0-1)
-                        float livenessScore = liveScore;
-
-                        // 11. Tentukan apakah live berdasarkan threshold
+                        // 6. Tentukan apakah live berdasarkan threshold (0.75 untuk HRIS production)
                         boolean isLive = livenessScore > LIVENESS_THRESHOLD;
 
-                        // 12. Tentukan tingkat kepercayaan
+                        // 7. Tentukan tingkat kepercayaan
                         String confidence;
                         if (livenessScore > 0.85f || livenessScore < 0.15f) {
                             confidence = "HIGH";
@@ -401,7 +401,7 @@ public class FaceRecognitionPlugin extends Plugin {
                             confidence = "LOW";
                         }
 
-                        // 13. Kirim hasil ke JavaScript
+                        // 8. Kirim hasil ke JavaScript
                         JSObject ret = new JSObject();
                         ret.put("isLive", isLive);
                         ret.put("score", livenessScore);
@@ -416,6 +416,64 @@ public class FaceRecognitionPlugin extends Plugin {
 
         } catch (Exception e) {
             call.reject("Error memproses gambar untuk liveness check", e);
+        }
+    }
+
+    /**
+     * Menjalankan satu inferensi anti-spoofing untuk satu scale tertentu.
+     *
+     * @param bitmap      Bitmap gambar asli
+     * @param bounds      Bounding box wajah dari ML Kit
+     * @param scaleFactor Faktor perbesaran area crop
+     *                    1.0 = crop ketat (wajah saja)
+     *                    2.7 = crop lebar (sesuai paper MiniFASNet, tangkap artefak layar/foto)
+     * @return Skor liveness (0.0 = spoof, 1.0 = live), atau -1 jika gagal
+     */
+    private float runAntiSpoofInference(Bitmap bitmap, Rect bounds, float scaleFactor) {
+        try {
+            // 1. Buat bounding box menjadi BUJUR SANGKAR (square) terlebih dahulu
+            // Model MiniFASNet sangat sensitif terhadap distorsi aspect ratio
+            int cx = bounds.left + bounds.width() / 2;
+            int cy = bounds.top + bounds.height() / 2;
+            int side = Math.max(bounds.width(), bounds.height());
+
+            // 2. Perbesar bujur sangkar berdasarkan scaleFactor
+            int newSide = (int) (side * scaleFactor);
+            int expandW = newSide / 2;
+            int expandH = newSide / 2;
+
+            // 3. Hitung koordinat crop dan pastikan tidak keluar dari batas gambar
+            int left   = Math.max(0, cx - expandW);
+            int top    = Math.max(0, cy - expandH);
+            int right  = Math.min(bitmap.getWidth(), cx + expandW);
+            int bottom = Math.min(bitmap.getHeight(), cy + expandH);
+            int width  = right - left;
+            int height = bottom - top;
+
+            // Crop wajah
+            Bitmap croppedFace = Bitmap.createBitmap(bitmap, left, top, width, height);
+
+            // Resize ke ANTI_SPOOF_INPUT_SIZE x ANTI_SPOOF_INPUT_SIZE (80x80)
+            Bitmap scaledFace = Bitmap.createScaledBitmap(
+                    croppedFace, ANTI_SPOOF_INPUT_SIZE, ANTI_SPOOF_INPUT_SIZE, true);
+
+            // Konversi ke ByteBuffer
+            ByteBuffer inputBuffer = bitmapToByteBufferAntiSpoof(scaledFace, ANTI_SPOOF_INPUT_SIZE);
+
+            // Output model MiniFASNet: [1, 3] → [spoof_print, real/live, spoof_replay]
+            float[][] outputArray = new float[1][ANTI_SPOOF_OUTPUT_SIZE];
+
+            // Jalankan inference
+            antiSpoofInterpreter.run(inputBuffer, outputArray);
+
+            // Model TFLite biasanya sudah memiliki layer Softmax bawaan di akhir (output 0.0 - 1.0).
+            // JANGAN lakukan softmax manual lagi, langsung ambil probabilitas aslinya.
+            // Index 1 = Wajah Asli (Real Face)
+            return outputArray[0][1];
+
+        } catch (Exception e) {
+            android.util.Log.e("AntiSpoof", "Inference error (scale " + scaleFactor + "): " + e.getMessage());
+            return -1f;  // sinyal gagal
         }
     }
 
@@ -466,7 +524,6 @@ public class FaceRecognitionPlugin extends Plugin {
 
     // ============================
     // Preprocessing — Anti-Spoofing (MiniFASNet)
-    // Normalisasi ke [0, 1] + channel order BGR (MiniFASNet dilatih dengan OpenCV = BGR)
     // ============================
     private ByteBuffer bitmapToByteBufferAntiSpoof(Bitmap bitmap, int size) {
         int bufferSize = 1 * size * size * PIXEL_CHANNELS * BYTES_PER_FLOAT;
@@ -482,8 +539,10 @@ public class FaceRecognitionPlugin extends Plugin {
             int g = (pixelValue >> 8) & 0xFF;
             int b = pixelValue & 0xFF;
 
-            // MiniFASNet dilatih dengan OpenCV (BGR), normalisasi HILANGKAN (model asli pakai [0, 255])
-            // Urutan channel: B, G, R (BUKAN R, G, B)
+            // Model TFLite ini diexport dengan preprocessing bawaan (kemungkinan normalization node ada di dalam graf)
+            // sehingga model mengekspektasikan nilai piksel raw [0, 255].
+            // Jika kita paksa ke [-1, 1], model akan melihat gambar "hitam" dan menganggapnya Spoof.
+            // Format yang diminta: B, G, R
             byteBuffer.putFloat((float) b);
             byteBuffer.putFloat((float) g);
             byteBuffer.putFloat((float) r);
