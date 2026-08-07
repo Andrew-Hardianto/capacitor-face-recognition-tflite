@@ -1,6 +1,6 @@
 # capacitor-face-recognition-tflite
 
-Capacitor plugin untuk **Face Recognition** + **Anti-Spoofing (Passive Liveness Detection)** menggunakan ML Kit & TensorFlow Lite, berjalan sepenuhnya on-device tanpa koneksi internet.
+Capacitor plugin untuk **Face Recognition** + **Anti-Spoofing (Passive Liveness Detection)** menggunakan ML Kit & TensorFlow Lite.
 
 ---
 
@@ -20,7 +20,7 @@ Capacitor plugin untuk **Face Recognition** + **Anti-Spoofing (Passive Liveness 
 
 | Dependency | Minimum Version |
 |------------|----------------|
-| `@capacitor/core` | `>= 8.0.0` |
+| `@capacitor/core` | `>= 7.0.0` |
 
 ### Android
 
@@ -214,13 +214,11 @@ async function verifyFaceWithLiveness(imageBase64: string, storedEmbedding: numb
 
 ```typescript
 async function enrollFace(imageBase64: string): Promise<number[]> {
-  // Cek liveness sebelum menyimpan
   const liveness = await FaceRecognition.checkLiveness({ imageBase64 });
   if (!liveness.isLive) throw new Error('Wajah tidak terdeteksi sebagai live');
 
-  // Ekstrak dan simpan embedding
   const { embedding } = await FaceRecognition.extractFaceFeature({ imageBase64 });
-  return embedding; // Simpan ke database / AsyncStorage
+  return embedding; 
 }
 ```
 
