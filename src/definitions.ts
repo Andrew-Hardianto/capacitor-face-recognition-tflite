@@ -45,7 +45,7 @@ export interface FaceRecognitionPlugin {
    */
   detectFaces(options: { imageBase64: string }): Promise<{
     count: number;
-    faces: Array<{
+    faces: {
       x: number;
       y: number;
       width: number;
@@ -58,6 +58,6 @@ export interface FaceRecognitionPlugin {
       leftEyeOpenProbability: number | null;
       /** Probabilitas mata kanan terbuka (0.0 = tutup, 1.0 = buka). Null jika tidak dapat dihitung. */
       rightEyeOpenProbability: number | null;
-    }>;
+    }[];
   }>;
 }
