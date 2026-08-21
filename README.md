@@ -158,7 +158,7 @@ detectFaces(options: { imageBase64: string; }) => Promise<{ count: number; faces
 ```
 
 Detects all faces in the image without performing recognition.
-Useful for early validation and blink challenges in the JS layer.
+Useful for early validation and blink challenge in JS layer.
 
 iOS: uses VNDetectFaceLandmarksRequest for eye landmarks (EAR-based).
 Android: uses ML Kit with CLASSIFICATION_MODE_ALL.
