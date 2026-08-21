@@ -15,19 +15,19 @@
     "Package.swift",
     "CapacitorFaceRecognitionTflite.podspec"
   ],
-  "author": "",
+  "author": "Andrew Hardianto",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com//capacitor-face-recognition.git"
+    "url": "git+https://github.com/Andrew-Hardianto/capacitor-face-recognition-tflite.git"
   },
   "bugs": {
-    "url": "https://github.com//capacitor-face-recognition/issues"
+    "url": "https://github.com/Andrew-Hardianto/capacitor-face-recognition-tflite/issues"
   },
   "keywords": [
     "capacitor",
     "plugin",
-    "native"
+    "face-recognition"
   ],
   "scripts": {
     "verify": "npm run verify:ios && npm run verify:android && npm run verify:web",

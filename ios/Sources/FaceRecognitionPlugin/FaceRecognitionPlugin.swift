@@ -40,8 +40,12 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     // Output model: 3 kelas softmax → [live_score, print_spoof_score, replay_spoof_score]
     // Index 0 = live (wajah asli)
     private let antiSpoofOutputSize = 3
-    // Threshold liveness: skor live (index 0) di atas ini dianggap Live
-    private let livenessThreshold: Float = 0.5
+    // Threshold liveness (HRIS production): skor live di atas ini dianggap Live
+    // Dinaikkan ke 0.75 untuk mencegah foto/replay di lingkungan HRIS
+    private let livenessThreshold: Float = 0.75
+    // Scale factor untuk multi-scale inference (sesuai paper MiniFASNet)
+    // Scale 1.0 = crop ketat, Scale 2.7 = crop lebar (tangkap artefak tepi foto/layar)
+    private let antiSpoofScales: [CGFloat] = [1.0, 2.7]
 
     /// Menentukan bundle yang tepat untuk mencari model TFLite:
     /// - Swift Package Manager (SPM): gunakan `Bundle.module` (bundle plugin itu sendiri)
@@ -235,13 +239,13 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     // ============================
     // detectFaces
     // ============================
-    /// Mendeteksi semua wajah dalam gambar menggunakan Apple Vision.
-    /// Mengembalikan jumlah wajah, bounding box, euler angles, dan estimasi eye open probability.
+    /// Mendeteksi semua wajah dalam gambar menggunakan Apple Vision dengan landmarks.
+    /// Mengembalikan jumlah wajah, bounding box, eye open probability, dan head angle.
     ///
-    /// Berguna untuk validasi kualitas frame kamera:
-    ///   - Pastikan tepat 1 wajah (count == 1)
-    ///   - Cek kepala lurus: abs(headEulerAngleY) < 15 && abs(headEulerAngleZ) < 15
-    ///   - Cek mata terbuka: leftEyeOpenProbability > 0.4 && rightEyeOpenProbability > 0.4
+    /// Berguna untuk:
+    ///   - Validasi awal: pastikan tepat 1 wajah sebelum extractFaceFeature
+    ///   - Blink detection untuk liveness challenge di layer JS (HRIS production)
+    ///   - Koordinat wajah untuk UI overlay
     @objc func detectFaces(_ call: CAPPluginCall) {
         // 1. Decode Base64 ke UIImage
         guard let imageBase64 = call.getString("imageBase64"),
@@ -253,20 +257,19 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
-        let imgWidth  = image.size.width
-        let imgHeight = image.size.height
-
-        // 2. Gunakan VNDetectFaceLandmarksRequest untuk mendapatkan:
-        //    - bounding box wajah
-        //    - roll & yaw (euler angles)
-        //    - face landmarks (untuk estimasi eye open probability)
-        let landmarksRequest = VNDetectFaceLandmarksRequest { (req, error) in
+        // 2. Deteksi wajah + landmarks menggunakan Apple Vision
+        // VNDetectFaceLandmarksRequest mencakup deteksi wajah + landmark (mata, hidung, dll)
+        let request = VNDetectFaceLandmarksRequest { (req, error) in
             if let err = error {
                 call.reject("Vision gagal mendeteksi: \(err.localizedDescription)")
                 return
             }
 
             let results = req.results as? [VNFaceObservation] ?? []
+            let imgWidth  = image.size.width
+            let imgHeight = image.size.height
+
+            // 3. Konversi bounding box dan ekstrak data landmark
             var facesArray: [[String: Any]] = []
 
             for face in results {
@@ -278,28 +281,40 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                 let width  = bb.size.width  * imgWidth
                 let height = bb.size.height * imgHeight
 
-                // 4. Euler angles dari VNFaceObservation (dalam radian → konversi ke derajat)
-                // roll  = headEulerAngleZ (miring kiri/kanan)
-                // yaw   = headEulerAngleY (menghadap kiri/kanan)
-                let eulerZ = face.roll.map { Double(truncating: $0) * (180.0 / .pi) } ?? 0.0
-                let eulerY = face.yaw.map  { Double(truncating: $0) * (180.0 / .pi) } ?? 0.0
+                // Head roll angle dari Vision (yaw tidak tersedia)
+                let roll = face.roll?.doubleValue ?? 0.0
 
-                // 5. Estimasi eye open probability dari face landmarks (Eye Aspect Ratio)
-                // Apple Vision tidak menyediakan ini secara native, jadi kita estimasi dari
-                // jarak kelopak mata atas-bawah dibagi lebar mata (EAR)
-                var leftEyeProb:  Double? = nil
-                var rightEyeProb: Double? = nil
+                // Estimasi eye open probability dari Eye Aspect Ratio (EAR) landmark mata
+                var leftEyeOpenProb: Double = -1.0
+                var rightEyeOpenProb: Double = -1.0
 
                 if let landmarks = face.landmarks {
-                    // Eye Aspect Ratio (EAR) = tinggi mata / lebar mata
-                    // Threshold EAR > ~0.2 = mata terbuka, < 0.2 = mata tertutup/merem
-                    // Kita normalisasi ke range 0.0-1.0 agar konsisten dengan Android
-
-                    if let leftEye = landmarks.leftEye, leftEye.pointCount >= 6 {
-                        leftEyeProb = self.eyeOpenProbability(from: leftEye.normalizedPoints)
+                    if let leftEye = landmarks.leftEye {
+                        let pts = leftEye.normalizedPoints
+                        if pts.count >= 4 {
+                            let ys = pts.map { $0.y }
+                            let xs = pts.map { $0.x }
+                            let eyeHeight = (ys.max() ?? 0) - (ys.min() ?? 0)
+                            let eyeWidth  = (xs.max() ?? 0) - (xs.min() ?? 0)
+                            if eyeWidth > 0 {
+                                let ear = eyeHeight / eyeWidth
+                                // EAR: ~0.05 = tutup, ~0.3 = buka penuh
+                                leftEyeOpenProb = min(1.0, max(0.0, Double((ear - 0.05) / 0.25)))
+                            }
+                        }
                     }
-                    if let rightEye = landmarks.rightEye, rightEye.pointCount >= 6 {
-                        rightEyeProb = self.eyeOpenProbability(from: rightEye.normalizedPoints)
+                    if let rightEye = landmarks.rightEye {
+                        let pts = rightEye.normalizedPoints
+                        if pts.count >= 4 {
+                            let ys = pts.map { $0.y }
+                            let xs = pts.map { $0.x }
+                            let eyeHeight = (ys.max() ?? 0) - (ys.min() ?? 0)
+                            let eyeWidth  = (xs.max() ?? 0) - (xs.min() ?? 0)
+                            if eyeWidth > 0 {
+                                let ear = eyeHeight / eyeWidth
+                                rightEyeOpenProb = min(1.0, max(0.0, Double((ear - 0.05) / 0.25)))
+                            }
+                        }
                     }
                 }
 
@@ -308,12 +323,12 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                     "y":               Int(max(0, y)),
                     "width":           Int(min(width,  imgWidth  - max(0, x))),
                     "height":          Int(min(height, imgHeight - max(0, y))),
-                    "headEulerAngleY": eulerY,
-                    "headEulerAngleZ": eulerZ,
+                    "headEulerAngleY": 0.0,  // tidak tersedia di Vision Framework
+                    "headEulerAngleZ": roll,
                 ]
-                // Gunakan NSNull agar JS menerima null (bukan undefined)
-                faceDict["leftEyeOpenProbability"]  = leftEyeProb  as Any? ?? NSNull()
-                faceDict["rightEyeOpenProbability"] = rightEyeProb as Any? ?? NSNull()
+                // Hanya set jika berhasil dihitung
+                if leftEyeOpenProb >= 0 { faceDict["leftEyeOpenProbability"]  = leftEyeOpenProb }
+                if rightEyeOpenProb >= 0 { faceDict["rightEyeOpenProbability"] = rightEyeOpenProb }
 
                 facesArray.append(faceDict)
             }
@@ -352,20 +367,21 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
-    // checkLiveness (Anti-Spoofing)
+    // checkLiveness (Anti-Spoofing) — Production HRIS
     // ============================
     /// Memeriksa apakah wajah dalam gambar adalah wajah asli (live) atau spoofing.
     ///
-    /// Alur kerja:
+    /// Alur kerja (Multi-Scale MiniFASNet):
     ///   1. Decode Base64 → UIImage
-    ///   2. Apple Vision → deteksi wajah → crop region wajah (dengan margin)
-    ///   3. Resize ke 128×128 (input MiniFASNet)
-    ///   4. TFLite inference model anti-spoofing
-    ///   5. Output: [spoof_score, live_score] → softmax → livenessScore
+    ///   2. Apple Vision → deteksi wajah → bounding box
+    ///   3. Inference DUA KALI dengan scale factor berbeda (1.0x dan 2.7x)
+    ///      - Scale 1.0: crop ketat (wajah saja)
+    ///      - Scale 2.7: crop lebar (tangkap artefak tepi foto/layar)
+    ///   4. Average kedua skor liveness
+    ///   5. Threshold 0.75 untuk HRIS production
     ///   6. Return isLive, score, confidence ke JavaScript
     ///
     /// Memerlukan file 'anti_spoof.tflite' di bundle iOS.
-    /// Download: https://github.com/minivision-ai/Silent-Face-Anti-Spoofing
     @objc func checkLiveness(_ call: CAPPluginCall) {
         // Periksa apakah model anti-spoofing tersedia
         guard let antiSpoofInterpreter = antiSpoofInterpreter else {
@@ -403,85 +419,64 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                 return
             }
 
-            // 3. Konversi bounding box Vision (koordinat dari kiri bawah → kiri atas)
             let imgWidth = image.size.width
             let imgHeight = image.size.height
             let bb = face.boundingBox
 
-            // Tambahkan margin 20% agar konteks kulit sekitar wajah ikut tertangkap
-            // (membantu model mendeteksi tepi foto / layar)
-            let marginW = bb.size.width * 0.2
-            let marginH = bb.size.height * 0.2
-
-            let faceRect = CGRect(
-                x: max(0, bb.origin.x * imgWidth - marginW * imgWidth),
-                y: max(0, (1 - bb.origin.y - bb.size.height) * imgHeight - marginH * imgHeight),
-                width: min(imgWidth, (bb.size.width + 2 * marginW) * imgWidth),
-                height: min(imgHeight, (bb.size.height + 2 * marginH) * imgHeight)
+            // Bounding box wajah dalam koordinat piksel (kiri atas, tanpa margin — multi-scale yang atur)
+            let baseFaceRect = CGRect(
+                x: bb.origin.x * imgWidth,
+                y: (1 - bb.origin.y - bb.size.height) * imgHeight,
+                width: bb.size.width * imgWidth,
+                height: bb.size.height * imgHeight
             )
 
-            // 4. Crop wajah (dengan margin)
-            guard let croppedCgImage = cgImage.cropping(to: faceRect) else {
-                call.reject("Gagal memotong gambar wajah untuk liveness check")
+            // 3. Multi-Scale Inference: jalankan anti-spoof untuk setiap scale
+            var scaleScores: [Float] = []
+
+            for scaleFactor in self.antiSpoofScales {
+                guard let score = self.runAntiSpoofInference(
+                    interpreter: antiSpoofInterpreter,
+                    image: image,
+                    cgImage: cgImage,
+                    baseFaceRect: baseFaceRect,
+                    scaleFactor: scaleFactor,
+                    imgWidth: imgWidth,
+                    imgHeight: imgHeight
+                ) else {
+                    continue
+                }
+                scaleScores.append(score)
+            }
+
+            guard !scaleScores.isEmpty else {
+                call.reject("Gagal menjalankan anti-spoof inference")
                 return
             }
 
-            // 5. Resize ke antiSpoofInputSize x antiSpoofInputSize (80x80)
-            let targetSize = CGSize(width: self.antiSpoofInputSize, height: self.antiSpoofInputSize)
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = 1
-            let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
-            let scaledImage = renderer.image { _ in
-                UIImage(cgImage: croppedCgImage).draw(in: CGRect(origin: .zero, size: targetSize))
+            // 4. Average semua score dari berbagai scale
+            let livenessScore = scaleScores.reduce(0, +) / Float(scaleScores.count)
+            print("[AntiSpoof] Scale scores: \(scaleScores), Final: \(livenessScore)")
+
+            // 5. Tentukan apakah live berdasarkan threshold (0.75 untuk HRIS production)
+            let isLive = livenessScore > self.livenessThreshold
+
+            // 6. Tentukan tingkat kepercayaan
+            let confidence: String
+            if livenessScore > 0.85 || livenessScore < 0.15 {
+                confidence = "HIGH"
+            } else if livenessScore > 0.6 || livenessScore < 0.4 {
+                confidence = "MEDIUM"
+            } else {
+                confidence = "LOW"
             }
 
-            // 6. Konversi UIImage ke Data input TFLite (normalisasi ke [-1, 1])
-            guard let inputData = self.imageToInputData(scaledImage, size: self.antiSpoofInputSize) else {
-                call.reject("Gagal mengkonversi gambar ke format TFLite input anti-spoofing")
-                return
-            }
-
-            // 7. Set input tensor & jalankan inference
-            do {
-                try antiSpoofInterpreter.copy(inputData, toInputAt: 0)
-                try antiSpoofInterpreter.invoke()
-
-                // 8. Ambil output tensor — shape: [1, 3] → [live_score, print_spoof, replay_spoof]
-                let outputTensor = try antiSpoofInterpreter.output(at: 0)
-                let outputData = outputTensor.data
-
-                // 9. Konversi output bytes ke [Float]
-                var scores = [Float](repeating: 0, count: 3)
-                _ = scores.withUnsafeMutableBytes { ptr in
-                    outputData.copyBytes(to: ptr)
-                }
-
-                // 10. Output model sudah dalam bentuk softmax probability
-                // Index 0 = live, Index 1 = print spoof, Index 2 = replay spoof
-                let livenessScore = scores[0]
-
-                // 11. Tentukan apakah live berdasarkan threshold
-                let isLive = livenessScore > self.livenessThreshold
-
-                // 12. Tentukan tingkat kepercayaan
-                let confidence: String
-                if livenessScore > 0.85 || livenessScore < 0.15 {
-                    confidence = "HIGH"
-                } else if livenessScore > 0.6 || livenessScore < 0.4 {
-                    confidence = "MEDIUM"
-                } else {
-                    confidence = "LOW"
-                }
-
-                // 13. Kirim hasil ke JavaScript
-                call.resolve([
-                    "isLive": isLive,
-                    "score": livenessScore,
-                    "confidence": confidence,
-                ])
-            } catch {
-                call.reject("TFLite anti-spoofing inference gagal: \(error.localizedDescription)")
-            }
+            // 7. Kirim hasil ke JavaScript
+            call.resolve([
+                "isLive": isLive,
+                "score": livenessScore,
+                "confidence": confidence,
+            ])
         }
 
         // Eksekusi Vision Request
@@ -494,13 +489,97 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
-    // Helper: UIImage → ByteData TFLite
+    // Helper: Multi-Scale Anti-Spoof Inference
+    // ============================
+    /// Menjalankan satu inferensi anti-spoofing untuk satu scale tertentu.
+    ///
+    /// - Parameters:
+    ///   - interpreter: TFLite interpreter anti-spoof
+    ///   - image: UIImage asli (untuk rendering)
+    ///   - cgImage: CGImage dari UIImage asli (untuk crop)
+    ///   - baseFaceRect: Bounding box wajah dalam koordinat piksel (tanpa margin)
+    ///   - scaleFactor: Faktor perbesaran area crop
+    ///                  1.0 = crop ketat (wajah saja + sedikit sekitar)
+    ///                  2.7 = crop lebar (sesuai paper MiniFASNet, tangkap artefak layar/foto)
+    ///   - imgWidth / imgHeight: Dimensi gambar asli
+    /// - Returns: Skor liveness (0.0 = spoof, 1.0 = live), nil jika gagal
+    private func runAntiSpoofInference(
+        interpreter: Interpreter,
+        image: UIImage,
+        cgImage: CGImage,
+        baseFaceRect: CGRect,
+        scaleFactor: CGFloat,
+        imgWidth: CGFloat,
+        imgHeight: CGFloat
+    ) -> Float? {
+        // 1. Buat bounding box menjadi BUJUR SANGKAR (square) terlebih dahulu
+        // Model MiniFASNet sangat sensitif terhadap distorsi aspect ratio
+        let cx = baseFaceRect.origin.x + baseFaceRect.width / 2.0
+        let cy = baseFaceRect.origin.y + baseFaceRect.height / 2.0
+        let side = max(baseFaceRect.width, baseFaceRect.height)
+
+        // 2. Perbesar bujur sangkar berdasarkan scaleFactor
+        let newSide = side * scaleFactor
+        let expandW = newSide / 2.0
+        let expandH = newSide / 2.0
+
+        // 3. Hitung koordinat crop dan pastikan tidak keluar dari batas gambar
+        let expandedX = max(0, cx - expandW)
+        let expandedY = max(0, cy - expandH)
+        let expandedW = min(imgWidth - expandedX, cx + expandW - expandedX)
+        let expandedH = min(imgHeight - expandedY, cy + expandH - expandedY)
+
+        let faceRect = CGRect(x: expandedX, y: expandedY, width: expandedW, height: expandedH)
+
+        guard let croppedCgImage = cgImage.cropping(to: faceRect) else { return nil }
+
+        // Resize ke 80x80
+        let targetSize = CGSize(width: antiSpoofInputSize, height: antiSpoofInputSize)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let scaledImage = renderer.image { _ in
+            UIImage(cgImage: croppedCgImage).draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+
+        guard let inputData = imageToInputDataAntiSpoof(scaledImage, size: antiSpoofInputSize) else {
+            return nil
+        }
+
+        do {
+            try interpreter.copy(inputData, toInputAt: 0)
+            try interpreter.invoke()
+
+            let outputTensor = try interpreter.output(at: 0)
+            let outputData = outputTensor.data
+
+            var scores = [Float](repeating: 0, count: antiSpoofOutputSize)
+            _ = scores.withUnsafeMutableBytes { ptr in
+                outputData.copyBytes(to: ptr)
+            }
+
+            // Model MiniFASNet ini ternyata mengeluarkan raw logits, bukan probabilitas.
+            // Kita HARUS melakukan softmax agar rentang nilainya menjadi 0.0 - 1.0.
+            let probs = softmax(scores)
+            
+            // Index 1 = Wajah Asli (Real Face)
+            return probs[1]
+
+        } catch {
+            print("[AntiSpoof] Inference error (scale \(scaleFactor)): \(error)")
+            return nil
+        }
+    }
+
+    // ============================
+    // Helper: UIImage → ByteData TFLite — Face Recognition (MobileFaceNet)
+    // Normalisasi ke [-1, 1]
     // ============================
     /// Konversi UIImage ke Data berformat [R, G, B, R, G, B, ...]
     /// dengan normalisasi ke [-1, 1]: normalized = (pixel / 128.0) - 1.0
     ///
     /// - Parameter image: UIImage yang sudah di-resize ke ukuran yang sesuai
-    /// - Parameter size: Ukuran input model (112 untuk face recognition, 128 untuk anti-spoofing)
+    /// - Parameter size: Ukuran input model (112 untuk face recognition)
     private func imageToInputData(_ image: UIImage, size: Int) -> Data? {
         guard let cgImage = image.cgImage else { return nil }
 
@@ -542,5 +621,64 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         return floatBuffer.withUnsafeBytes { Data($0) }
+    }
+
+    // ============================
+    // Helper: UIImage → ByteData TFLite — Anti-Spoofing (MiniFASNet)
+    // ============================
+    private func imageToInputDataAntiSpoof(_ image: UIImage, size: Int) -> Data? {
+        guard let cgImage = image.cgImage else { return nil }
+
+        let width = size
+        let height = size
+        let bytesPerPixel = 4 // RGBA
+        let bytesPerRow = width * bytesPerPixel
+        let totalBytes = height * bytesPerRow
+
+        var rawPixels = [UInt8](repeating: 0, count: totalBytes)
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: &rawPixels,
+                  width: width,
+                  height: height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: bytesPerRow,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+              )
+        else { return nil }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        // Model TFLite ini diexport dengan preprocessing bawaan (kemungkinan normalization node ada di dalam graf)
+        // sehingga model mengekspektasikan nilai piksel raw [0, 255].
+        // Format yang diminta: B, G, R
+        var floatBuffer = [Float](repeating: 0, count: width * height * 3)
+        var floatIndex = 0
+
+        for i in stride(from: 0, to: totalBytes, by: bytesPerPixel) {
+            let r = Float(rawPixels[i])
+            let g = Float(rawPixels[i + 1])
+            let b = Float(rawPixels[i + 2])
+
+            // BGR order (unnormalized)
+            floatBuffer[floatIndex]     = b
+            floatBuffer[floatIndex + 1] = g
+            floatBuffer[floatIndex + 2] = r
+            floatIndex += 3
+        }
+
+        return floatBuffer.withUnsafeBytes { Data($0) }
+    }
+
+    // ============================
+    // Softmax — konversi raw logits ke probability
+    // ============================
+    private func softmax(_ logits: [Float]) -> [Float] {
+        let maxVal = logits.max() ?? 0
+        let exps = logits.map { exp($0 - maxVal) }
+        let sumExps = exps.reduce(0, +)
+        return exps.map { $0 / sumExps }
     }
 }

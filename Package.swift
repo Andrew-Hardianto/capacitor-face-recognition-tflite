@@ -11,7 +11,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", from: "8.0.0"),
-        .package(url: "https://github.com/tensorflow/tensorflow.git", from: "2.14.0"),
+        .package(url: "https://github.com/kewlbear/TensorFlowLiteSwift.git", branch: "master"),
     ],
     targets: [
         .target(
@@ -19,7 +19,7 @@ let package = Package(
             dependencies: [
                 .product(name: "Capacitor", package: "capacitor-swift-pm"),
                 .product(name: "Cordova", package: "capacitor-swift-pm"),
-                .product(name: "TensorFlowLite", package: "tensorflow"),
+                .product(name: "TensorFlowLiteSwift", package: "TensorFlowLiteSwift"),
             ],
             path: "ios/Sources/FaceRecognitionPlugin",
             resources: [
