@@ -35,7 +35,7 @@ Capacitor plugin for **Face Recognition** + **Anti-Spoofing (Passive Liveness De
 | `org.tensorflow:tensorflow-lite` | `2.14.0` |
 | `org.tensorflow:tensorflow-lite-support` | `0.4.4` |
 
-> ⚠️ ML Kit Face Detection requires **Google Play Services** to be installed. Devices without Google Play Services (pure AOSP) are not supported.
+> ℹ️ Uses bundled ML Kit (`com.google.mlkit:face-detection`) & local TensorFlow Lite runtime. Fully functional on offline and non-Google Play Services devices (e.g. Huawei HMS, pure AOSP).
 
 ### iOS
 
@@ -158,7 +158,7 @@ detectFaces(options: { imageBase64: string; }) => Promise<{ count: number; faces
 ```
 
 Detects all faces in the image without performing recognition.
-Useful for early validation and blink challenges in the JS layer.
+Useful for early validation and blink challenge in JS layer.
 
 iOS: uses VNDetectFaceLandmarksRequest for eye landmarks (EAR-based).
 Android: uses ML Kit with CLASSIFICATION_MODE_ALL.
@@ -314,7 +314,7 @@ Error: Failed to load TFLite model. Make sure 'mobile_face_net.tflite' exists in
 ### Android — No face detected
 - Ensure the image is well-lit and the face is clearly visible
 - Ensure the face is not too small (minimum ~20% of image size)
-- ML Kit requires Google Play Services — ensure the device supports it
+- Ensure the face orientation is upright or within acceptable tilt angles
 
 ### iOS — Model not found
 ```
