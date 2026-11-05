@@ -1,5 +1,15 @@
 import { WebPlugin } from '@capacitor/core';
-import type { FaceRecognitionPlugin } from './definitions';
+import type {
+  ChallengeType,
+  FaceRecognitionPlugin,
+  NativeSessionResult,
+  VerifyFaceResult,
+  VerifyFaceSequenceResult,
+} from './definitions';
+
+// Threshold — satu sumber kebenaran untuk implementasi web (match-v1)
+const MATCH_THRESHOLD = 0.75;
+const MATCH_THRESHOLD_VERSION = 'match-v1';
 
 export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlugin {
   async extractFaceFeature(_options: { imageBase64: string }): Promise<{ embedding: number[] }> {
@@ -11,6 +21,8 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
     isMatch: boolean;
     score: number;
     similarityPercentage: number;
+    threshold: number;
+    thresholdVersion: string;
   }> {
     if (options.vector1.length !== options.vector2.length) {
       throw new Error('Panjang vector tidak sama');
@@ -33,22 +45,41 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
 
     const score = dotProduct / (Math.sqrt(norm1) * Math.sqrt(norm2));
 
-    // THRESHOLD / AMBANG BATAS
-    // 0.75 adalah standar yang baik.
-    // Jika masih tembus wajah orang lain, naikkan ke 0.80 atau 0.85
-    const isMatch = score > 0.75;
+    // THRESHOLD / AMBANG BATAS — default 0.75, BELUM dikalibrasi (Fase 5)
+    const isMatch = score > MATCH_THRESHOLD;
     const similarityPercentage = Math.max(0, score * 100);
 
-    return { isMatch, score, similarityPercentage };
+    return {
+      isMatch,
+      score,
+      similarityPercentage,
+      threshold: MATCH_THRESHOLD,
+      thresholdVersion: MATCH_THRESHOLD_VERSION,
+    };
   }
 
   async checkLiveness(_options: { imageBase64: string }): Promise<{
     isLive: boolean;
     score: number;
     confidence: 'HIGH' | 'MEDIUM' | 'LOW';
+    label: 'LIVE' | 'PRINT' | 'REPLAY';
+    liveScore: number;
+    printScore: number;
+    replayScore: number;
+    thresholdVersion: string;
   }> {
     console.warn('checkLiveness (Anti-Spoofing) hanya berjalan di Android & iOS native.');
-    return { isLive: false, score: 0, confidence: 'LOW' };
+    // FAIL-CLOSED: web tidak pernah mengembalikan isLive true
+    return {
+      isLive: false,
+      score: 0,
+      confidence: 'LOW',
+      label: 'REPLAY',
+      liveScore: 0,
+      printScore: 0,
+      replayScore: 1,
+      thresholdVersion: 'liveness-v2',
+    };
   }
 
   async detectFaces(_options: { imageBase64: string }): Promise<{
@@ -58,6 +89,7 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
       y: number;
       width: number;
       height: number;
+      headEulerAngleX: number;
       headEulerAngleY: number;
       headEulerAngleZ: number;
       leftEyeOpenProbability: number | null;
@@ -66,5 +98,39 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
   }> {
     console.warn('detectFaces hanya berjalan di Android & iOS native.');
     return { count: 0, faces: [] };
+  }
+
+  async verifyFace(_options: {
+    imageBase64: string;
+    referenceEmbedding?: number[];
+  }): Promise<VerifyFaceResult> {
+    // FAIL-CLOSED: jangan pernah mengembalikan isLive true / embedding dari web
+    throw new Error('verifyFace hanya berjalan di Android & iOS native.');
+  }
+
+  async getLivenessChallenge(): Promise<{ challenge: ChallengeType }> {
+    const challenge: ChallengeType = Math.random() < 0.5 ? 'LOOK_LEFT' : 'LOOK_RIGHT';
+    return { challenge };
+  }
+
+  async verifyFaceSequence(_options: {
+    images: string[];
+    challenge: ChallengeType;
+    referenceEmbedding?: number[];
+  }): Promise<VerifyFaceSequenceResult> {
+    // FAIL-CLOSED: jangan pernah mengembalikan passed true dari web
+    throw new Error('verifyFaceSequence hanya berjalan di Android & iOS native.');
+  }
+
+  async captureLivenessSession(_options: {
+    challenge?: ChallengeType;
+    referenceEmbedding?: number[];
+  }): Promise<NativeSessionResult> {
+    // FAIL-CLOSED: native capture hanya tersedia di Android & iOS
+    throw new Error('captureLivenessSession hanya berjalan di Android & iOS native.');
+  }
+
+  async getDeviceIntegrity(): Promise<{ deviceIntegrity: import('./definitions').DeviceIntegrity }> {
+    throw new Error('getDeviceIntegrity hanya berjalan di Android & iOS native.');
   }
 }

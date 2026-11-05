@@ -1,25 +1,223 @@
 <!doctype html>
-<html lang="en" dir="ltr" class="hydrated">
+<html lang="id" dir="ltr" class="hydrated">
   <head>
     <meta charset="UTF-8" />
-    <title>Example Capacitor App</title>
+    <title>Face Recognition — Uji & Kalibrasi</title>
     <meta
       name="viewport"
       content="viewport-fit=cover, width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no"
     />
     <meta name="format-detection" content="telephone=no" />
+    <style>
+      :root {
+        --bg: #101418;
+        --panel: #1a2026;
+        --panel2: #222a32;
+        --text: #e8edf2;
+        --muted: #9db0c0;
+        --ok: #2ea56a;
+        --fail: #c94a4a;
+        --warn: #c98a2e;
+        --accent: #3b82c4;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 14px;
+      }
+      header { padding: 14px 16px 6px; }
+      header h1 { font-size: 18px; margin: 0 0 4px; }
+      header p { margin: 0; color: var(--muted); font-size: 12px; }
+      section {
+        background: var(--panel);
+        margin: 10px 12px;
+        padding: 12px;
+        border-radius: 10px;
+      }
+      section h2 { font-size: 14px; margin: 0 0 10px; color: var(--accent); }
+      video {
+        width: 100%;
+        max-height: 260px;
+        background: #000;
+        border-radius: 8px;
+        object-fit: cover;
+      }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+      button {
+        flex: 1;
+        min-width: 110px;
+        padding: 10px 12px;
+        border: 0;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      button.secondary { background: var(--panel2); color: var(--text); }
+      button.warn { background: var(--warn); }
+      button:disabled { opacity: 0.5; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      label.field { display: block; font-size: 11px; color: var(--muted); }
+      label.field span { display: flex; justify-content: space-between; }
+      input[type="range"] { width: 100%; }
+      input[type="number"], select {
+        width: 100%;
+        padding: 6px;
+        border-radius: 6px;
+        border: 1px solid var(--panel2);
+        background: var(--panel2);
+        color: var(--text);
+      }
+      .badge {
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-weight: 700;
+        font-size: 12px;
+      }
+      .badge.ok { background: var(--ok); }
+      .badge.fail { background: var(--fail); }
+      .badge.warn { background: var(--warn); }
+      pre {
+        background: var(--panel2);
+        padding: 10px;
+        border-radius: 8px;
+        overflow: auto;
+        max-height: 240px;
+        font-size: 11px;
+        margin: 8px 0 0;
+      }
+      table { width: 100%; border-collapse: collapse; font-size: 11px; }
+      th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--panel2); }
+      .hint { color: var(--muted); font-size: 11px; margin: 6px 0 0; }
+      .stat { font-size: 12px; margin: 4px 0; }
+      .stat b { font-size: 16px; }
+    </style>
   </head>
   <body>
-    <main>
-      <h1>Capacitor Test Plugin Project</h1>
-      <p>
-        This project can be used to test out the functionality of your plugin. Nothing in the
-        <em>example-app/</em> folder will be published to npm when using this template, so you can create away!
+    <header>
+      <h1>Uji & Kalibrasi Anti-Spoofing</h1>
+      <p>Fase 5 — golden/regression test, kalibrasi threshold, verifikasi tanda yaw.</p>
+    </header>
+
+    <!-- A. Kamera -->
+    <section>
+      <h2>1. Kamera</h2>
+      <video id="video" autoplay playsinline muted></video>
+      <div class="row">
+        <button id="btnStartCamera">Mulai Kamera</button>
+        <button id="btnStopCamera" class="secondary">Stop</button>
+      </div>
+      <div class="row">
+        <button id="btnCapture" class="secondary">Ambil Frame</button>
+        <label class="field" style="flex:1">
+          <span>Atau muat file gambar (regression test)</span>
+          <input type="file" id="fileInput" accept="image/*" />
+        </label>
+      </div>
+      <p class="hint">Frame yang diambil akan dipakai untuk semua uji di bawah.</p>
+    </section>
+
+    <!-- B. Yaw Sign Tester -->
+    <section>
+      <h2>2. Verifikasi Tanda Yaw (kalibrasi Fase 5)</h2>
+      <p class="hint">
+        Mulai stream, lalu toleh kepala ke KIRI dan amati tanda <b>yaw</b>.
+        Jika yaw bernilai <b>negatif</b> saat menoleh kiri → konvensi default sudah benar (yawSign = 1).
+        Jika positif → set yawSign = -1.
       </p>
-      <label for="echoInput">Echo Text:</label>
-      <input type="text" id="echoInput" name="echoInput" value="Hello World!" />
-      <button onclick="testEcho()">Click Me!</button>
-    </main>
+      <div class="row">
+        <button id="btnYawStream" class="secondary">Mulai Stream Angles</button>
+      </div>
+      <div class="stat">
+        yaw: <b id="yawValue">-</b> &nbsp; pitch: <b id="pitchValue">-</b> &nbsp; roll: <b id="rollValue">-</b>
+      </div>
+    </section>
+
+    <!-- C. Kalibrasi -->
+    <section>
+      <h2>3. Konfigurasi (LivenessConfig)</h2>
+      <div class="grid">
+        <label class="field"><span>liveThreshold <b id="v_liveThreshold">0.80</b></span>
+          <input type="range" id="liveThreshold" min="0.5" max="0.95" step="0.01" value="0.80" /></label>
+        <label class="field"><span>spoofVeto <b id="v_spoofVeto">0.20</b></span>
+          <input type="range" id="spoofVeto" min="0.05" max="0.5" step="0.01" value="0.20" /></label>
+        <label class="field"><span>minFaceRatio <b id="v_minFaceRatio">0.25</b></span>
+          <input type="range" id="minFaceRatio" min="0.1" max="0.5" step="0.01" value="0.25" /></label>
+        <label class="field"><span>blurMin <b id="v_blurMin">50</b></span>
+          <input type="range" id="blurMin" min="0" max="500" step="5" value="50" /></label>
+        <label class="field"><span>maxPose (derajat) <b id="v_maxPose">20</b></span>
+          <input type="range" id="maxPose" min="5" max="45" step="1" value="20" /></label>
+        <label class="field"><span>edgeMargin <b id="v_edgeMargin">0.05</b></span>
+          <input type="range" id="edgeMargin" min="0" max="0.2" step="0.01" value="0.05" /></label>
+        <label class="field"><span>exposureMin <b id="v_exposureMin">60</b></span>
+          <input type="range" id="exposureMin" min="0" max="120" step="5" value="60" /></label>
+        <label class="field"><span>exposureMax <b id="v_exposureMax">200</b></span>
+          <input type="range" id="exposureMax" min="120" max="255" step="5" value="200" /></label>
+      </div>
+      <div class="row">
+        <label class="field" style="flex:1"><span>minFrameSide (px)</span>
+          <input type="number" id="minFrameSide" value="480" /></label>
+        <label class="field" style="flex:1"><span>yawSign (1 / -1)</span>
+          <select id="yawSign"><option value="1">1 (default)</option><option value="-1">-1</option></select></label>
+        <label class="field" style="flex:1"><span>debug output</span>
+          <select id="debug"><option value="true">aktif</option><option value="false">mati</option></select></label>
+      </div>
+    </section>
+
+    <!-- D. Uji Single Frame -->
+    <section>
+      <h2>4. Uji Single Frame</h2>
+      <div class="row">
+        <button id="btnCheckLiveness">checkLiveness</button>
+        <button id="btnVerifyFace">verifyFace</button>
+        <button id="btnDetectFaces" class="secondary">detectFaces</button>
+      </div>
+      <div id="singleResult"></div>
+      <pre id="singleJson">Belum ada hasil.</pre>
+    </section>
+
+    <!-- E. Sesi Multi-frame + Challenge -->
+    <section>
+      <h2>5. Sesi Multi-frame (verifyFaceSequence)</h2>
+      <p class="hint" id="challengeHint">
+        Tekan mulai, ikuti instruksi challenge yang muncul. 5 frame diambil otomatis dalam ~1,5 detik.
+      </p>
+      <div class="row">
+        <button id="btnSession">Mulai Sesi Challenge</button>
+        <button id="btnNativeSession">Sesi Native (anti injeksi frame)</button>
+      </div>
+      <div id="sessionResult"></div>
+      <pre id="sessionJson">Belum ada hasil.</pre>
+    </section>
+
+    <!-- F. Dataset Logger -->
+    <section>
+      <h2>6. Dataset Logger (untuk APCER / BPCER)</h2>
+      <p class="hint">
+        Labeli setiap hasil uji sebagai LIVE / REPLAY / PRINT, lalu ekspor untuk analisis threshold.
+        Semakin banyak sampel per jenis serangan, semakin bermakna angkanya.
+      </p>
+      <div class="row">
+        <button id="btnLabelLive" class="secondary">Label: LIVE</button>
+        <button id="btnLabelReplay" class="warn">Label: REPLAY</button>
+        <button id="btnLabelPrint" class="warn">Label: PRINT</button>
+      </div>
+      <div class="stat" id="datasetStats">Belum ada sampel.</div>
+      <div class="row">
+        <button id="btnExportJson" class="secondary">Ekspor JSON</button>
+        <button id="btnExportCsv" class="secondary">Ekspor CSV</button>
+        <button id="btnClearLog" class="secondary">Bersihkan</button>
+      </div>
+      <table id="logTable">
+        <thead><tr><th>#</th><th>Jenis</th><th>Label</th><th>liveScore</th><th>Keterangan</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
 
     <script src="./js/example.js" type="module"></script>
   </body>

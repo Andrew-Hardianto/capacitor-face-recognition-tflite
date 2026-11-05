@@ -18,6 +18,7 @@ Pod::Spec.new do |s|
   # Model TFLite di-bundle ke dalam framework resource bundle
   s.resources = [
     'ios/Sources/FaceRecognitionPlugin/Resources/mobile_face_net.tflite',
-    'ios/Sources/FaceRecognitionPlugin/Resources/anti_spoof.tflite'
+    'ios/Sources/FaceRecognitionPlugin/Resources/anti_spoof_2_7.tflite',
+    'ios/Sources/FaceRecognitionPlugin/Resources/anti_spoof_4_0.tflite'
   ]
 end

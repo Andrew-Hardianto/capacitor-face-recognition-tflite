@@ -1,2 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Native capture (Fase 4) — kamera diakses dari dalam plugin -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <application>
+        <!-- Activity kamera untuk captureLivenessSession — tidak diekspor ke app lain -->
+        <activity
+            android:name="com.andrew.face.LivenessCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+    </application>
 </manifest>
