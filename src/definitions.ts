@@ -38,7 +38,11 @@ export interface LivenessConfig {
   exposureMin?: number;
   /** Mean luminance maksimum. Default 200 */
   exposureMax?: number;
-  /** Konvensi tanda yaw untuk challenge (1 atau -1). Default 1 */
+  /** Threshold cosine konsistensi identitas antar frame sebanding. Default 0.7 */
+  identityThreshold?: number;
+  /** Konvensi tanda yaw untuk challenge (1 atau -1). Default 1.
+   *  Diterapkan ke nilai yaw SEBELUM agregasi min/max. -1 membalik arah challenge
+   *  (mis. untuk frame ter-mirror, atau konvensi tanda platform yang berbeda). */
   yawSign?: number;
   /** Kembalikan data debug (probs per model). Default false */
   debug?: boolean;
@@ -93,6 +97,9 @@ export interface VerifyFaceSequenceResult {
   minYaw: number;
   frontalFrames: number;
   identityConsistent: boolean;
+  /** Cosine minimum antara frame sebanding terhadap frame referensi (paling frontal).
+   *  null jika kurang dari 2 frame sebanding. Untuk diagnostik kalibrasi. */
+  minIdentityCosine: number | null;
   thresholdVersion: string;
   match?: MatchResult;
 }
@@ -223,7 +230,10 @@ export interface FaceRecognitionPlugin {
    * - every frame must pass the quality gate
    * - median liveScore >= liveThreshold AND majority of frames isLive (voting,
    *   NOT "all frames must live")
-   * - identity consistent across frames (cosine >= 0.8 vs first frame)
+   * - identity consistent among pose-comparable frames (|yaw| <= 12 deg):
+   *   cosine >= identityThreshold (default 0.7) vs the MOST FRONTAL frame.
+   *   Frames with |yaw| > 12 deg serve the challenge only and are excluded —
+   *   their embeddings are not pose-invariant.
    * - challenge satisfied: yaw deviates >= 15 deg in the requested direction,
    *   then >= 2 frames return near frontal (|yaw| < 15 deg)
    */

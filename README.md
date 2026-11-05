@@ -231,7 +231,10 @@ Pass &gt;= 5 frames captured over ~1.5 seconds. Passing rules:
 - every frame must pass the quality gate
 - median liveScore &gt;= liveThreshold AND majority of frames isLive (voting,
   NOT "all frames must live")
-- identity consistent across frames (cosine &gt;= 0.8 vs first frame)
+- identity consistent among pose-comparable frames (|yaw| &lt;= 12 deg):
+  cosine &gt;= identityThreshold (default 0.7) vs the MOST FRONTAL frame.
+  Frames with |yaw| &gt; 12 deg serve the challenge only and are excluded —
+  their embeddings are not pose-invariant.
 - challenge satisfied: yaw deviates &gt;= 15 deg in the requested direction,
   then &gt;= 2 frames return near frontal (|yaw| &lt; 15 deg)
 
@@ -336,37 +339,39 @@ audit logging, not as a single gate.
 
 Konfigurasi liveness & quality gate — semua opsional (default lihat README).
 
-| Prop                | Type                 | Description                                                 |
-| ------------------- | -------------------- | ----------------------------------------------------------- |
-| **`liveThreshold`** | <code>number</code>  | Threshold liveScore minimum. Default 0.80                   |
-| **`spoofVeto`**     | <code>number</code>  | Veto: maksimum skor spoof yang ditoleransi. Default 0.20    |
-| **`minFrameSide`**  | <code>number</code>  | Sisi terpendek frame minimum (px). Default 480              |
-| **`minFaceRatio`**  | <code>number</code>  | faceWidth / frameWidth minimum. Default 0.25                |
-| **`edgeMargin`**    | <code>number</code>  | Margin tepi frame (0..1). Default 0.05                      |
-| **`maxPose`**       | <code>number</code>  | Maksimum \|yaw\|/\|pitch\|/\|roll\| (derajat). Default 20   |
-| **`blurMin`**       | <code>number</code>  | Variance of Laplacian minimum (perlu kalibrasi). Default 50 |
-| **`exposureMin`**   | <code>number</code>  | Mean luminance minimum. Default 60                          |
-| **`exposureMax`**   | <code>number</code>  | Mean luminance maksimum. Default 200                        |
-| **`yawSign`**       | <code>number</code>  | Konvensi tanda yaw untuk challenge (1 atau -1). Default 1   |
-| **`debug`**         | <code>boolean</code> | Kembalikan data debug (probs per model). Default false      |
+| Prop                    | Type                 | Description                                                                                                                                                                                                       |
+| ----------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`liveThreshold`**     | <code>number</code>  | Threshold liveScore minimum. Default 0.80                                                                                                                                                                         |
+| **`spoofVeto`**         | <code>number</code>  | Veto: maksimum skor spoof yang ditoleransi. Default 0.20                                                                                                                                                          |
+| **`minFrameSide`**      | <code>number</code>  | Sisi terpendek frame minimum (px). Default 480                                                                                                                                                                    |
+| **`minFaceRatio`**      | <code>number</code>  | faceWidth / frameWidth minimum. Default 0.25                                                                                                                                                                      |
+| **`edgeMargin`**        | <code>number</code>  | Margin tepi frame (0..1). Default 0.05                                                                                                                                                                            |
+| **`maxPose`**           | <code>number</code>  | Maksimum \|yaw\|/\|pitch\|/\|roll\| (derajat). Default 20                                                                                                                                                         |
+| **`blurMin`**           | <code>number</code>  | Variance of Laplacian minimum (perlu kalibrasi). Default 50                                                                                                                                                       |
+| **`exposureMin`**       | <code>number</code>  | Mean luminance minimum. Default 60                                                                                                                                                                                |
+| **`exposureMax`**       | <code>number</code>  | Mean luminance maksimum. Default 200                                                                                                                                                                              |
+| **`identityThreshold`** | <code>number</code>  | Threshold cosine konsistensi identitas antar frame sebanding. Default 0.7                                                                                                                                         |
+| **`yawSign`**           | <code>number</code>  | Konvensi tanda yaw untuk challenge (1 atau -1). Default 1. Diterapkan ke nilai yaw SEBELUM agregasi min/max. -1 membalik arah challenge (mis. untuk frame ter-mirror, atau konvensi tanda platform yang berbeda). |
+| **`debug`**             | <code>boolean</code> | Kembalikan data debug (probs per model). Default false                                                                                                                                                            |
 
 
 #### VerifyFaceSequenceResult
 
-| Prop                     | Type                                                                    |
-| ------------------------ | ----------------------------------------------------------------------- |
-| **`passed`**             | <code>boolean</code>                                                    |
-| **`reason`**             | <code><a href="#sequencefailurereason">SequenceFailureReason</a></code> |
-| **`challenge`**          | <code><a href="#challengetype">ChallengeType</a></code>                 |
-| **`medianLiveScore`**    | <code>number</code>                                                     |
-| **`liveVotes`**          | <code>number</code>                                                     |
-| **`frameCount`**         | <code>number</code>                                                     |
-| **`maxYaw`**             | <code>number</code>                                                     |
-| **`minYaw`**             | <code>number</code>                                                     |
-| **`frontalFrames`**      | <code>number</code>                                                     |
-| **`identityConsistent`** | <code>boolean</code>                                                    |
-| **`thresholdVersion`**   | <code>string</code>                                                     |
-| **`match`**              | <code><a href="#matchresult">MatchResult</a></code>                     |
+| Prop                     | Type                                                                    | Description                                                                                                                                           |
+| ------------------------ | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`passed`**             | <code>boolean</code>                                                    |                                                                                                                                                       |
+| **`reason`**             | <code><a href="#sequencefailurereason">SequenceFailureReason</a></code> |                                                                                                                                                       |
+| **`challenge`**          | <code><a href="#challengetype">ChallengeType</a></code>                 |                                                                                                                                                       |
+| **`medianLiveScore`**    | <code>number</code>                                                     |                                                                                                                                                       |
+| **`liveVotes`**          | <code>number</code>                                                     |                                                                                                                                                       |
+| **`frameCount`**         | <code>number</code>                                                     |                                                                                                                                                       |
+| **`maxYaw`**             | <code>number</code>                                                     |                                                                                                                                                       |
+| **`minYaw`**             | <code>number</code>                                                     |                                                                                                                                                       |
+| **`frontalFrames`**      | <code>number</code>                                                     |                                                                                                                                                       |
+| **`identityConsistent`** | <code>boolean</code>                                                    |                                                                                                                                                       |
+| **`minIdentityCosine`**  | <code>number \| null</code>                                             | Cosine minimum antara frame sebanding terhadap frame referensi (paling frontal). null jika kurang dari 2 frame sebanding. Untuk diagnostik kalibrasi. |
+| **`thresholdVersion`**   | <code>string</code>                                                     |                                                                                                                                                       |
+| **`match`**              | <code><a href="#matchresult">MatchResult</a></code>                     |                                                                                                                                                       |
 
 
 #### NativeSessionResult

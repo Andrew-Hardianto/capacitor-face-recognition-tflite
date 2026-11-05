@@ -105,7 +105,8 @@ public class FaceRecognitionPlugin extends Plugin {
     private static final float EXPOSURE_MIN = 60f;          // mean luminance wajah
     private static final float EXPOSURE_MAX = 200f;
     // Konsistensi identitas antar frame (verifyFaceSequence)
-    private static final float IDENTITY_CONSISTENCY = 0.8f; // cosine terhadap frame pertama
+    private static final float IDENTITY_CONSISTENCY = 0.70f; // default 0.70 (sebelumnya 0.8f terlalu ketat untuk mobile camera)
+    private static final float IDENTITY_MAX_POSE = 12f;     // hanya frame frontal (|yaw| <= 12°) yang dicek identitasnya; frame menoleh tugasnya challenge
     // Active challenge
     private static final float CHALLENGE_YAW_MIN = 15f;     // deviasi minimum yang diwajibkan
     private static final float CHALLENGE_FRONT_MAX = 15f;   // kembali mendekati frontal
@@ -614,7 +615,8 @@ public class FaceRecognitionPlugin extends Plugin {
      *   - SEMUA frame lolos quality gate
      *   - median liveScore ≥ liveThreshold DAN mayoritas frame isLive (voting,
      *     BUKAN "semua frame harus live" — lihat catatan BPCER di plan)
-     *   - identitas konsisten antar frame (cosine ≥ 0.8 terhadap frame pertama)
+     *   - identitas konsisten antar frame sebanding (cosine ≥ identityThreshold
+     *     terhadap frame paling frontal; frame dengan |yaw| > 20° dikecualikan)
      *   - challenge terpenuhi: yaw menyimpang ≥ 15° ke arah yang diminta, lalu
      *     minimal 2 frame kembali mendekati frontal (|yaw| < 15°)
      *
@@ -742,26 +744,53 @@ public class FaceRecognitionPlugin extends Plugin {
     private void finishSequence(SequenceSink sink, List<FrameResult> frames, GateConfig config,
                                 String challenge, JSONArray referenceEmbedding) {
         try {
-        float[] firstEmbedding = null;
-        boolean identityConsistent = true;
         String failureReason = null;
 
+        // SEMUA frame harus lolos quality gate
         for (FrameResult fr : frames) {
-            // SEMUA frame harus lolos quality gate
             if (!fr.quality.passed) {
                 failureReason = "QUALITY_FAILED";
                 break;
             }
+        }
 
-            // Konsistensi identitas terhadap frame pertama
-            if (fr.embedding != null) {
-                if (firstEmbedding == null) {
-                    firstEmbedding = fr.embedding;
-                } else {
-                    double cos = cosineSimilarity(firstEmbedding, fr.embedding);
-                    if (cos < IDENTITY_CONSISTENCY) {
-                        identityConsistent = false;
-                    }
+        // Referensi identitas = frame PALING FRONTAL (|yaw| terkecil), bukan frame
+        // pertama — embedding paling frontal paling stabil untuk pembanding.
+        FrameResult refFrame = null;
+        if (failureReason == null) {
+            for (FrameResult fr : frames) {
+                if (fr.embedding == null) continue;
+                if (refFrame == null || Math.abs(fr.yaw) < Math.abs(refFrame.yaw)) {
+                    refFrame = fr;
+                }
+            }
+        }
+        float[] refEmbedding = refFrame != null ? refFrame.embedding : null;
+
+        // Konsistensi identitas: hanya bandingkan frame "sebanding" (|yaw| <=
+        // IDENTITY_MAX_POSE). Frame dengan pose berat tugasnya membuktikan challenge;
+        // embedding-nya tidak pose-invariant dan tidak boleh mematikan sesi.
+        boolean identityConsistent = true;
+        Double minIdentityCosine = null;
+        List<Double> comparableCosines = new ArrayList<>();
+        if (failureReason == null && refEmbedding != null) {
+            for (FrameResult fr : frames) {
+                if (fr.embedding == null || fr == refFrame) continue;
+                if (Math.abs(fr.yaw) > IDENTITY_MAX_POSE) continue;
+                double cos = cosineSimilarity(refEmbedding, fr.embedding);
+                comparableCosines.add(cos);
+                if (minIdentityCosine == null || cos < minIdentityCosine) {
+                    minIdentityCosine = cos;
+                }
+            }
+            if (!comparableCosines.isEmpty()) {
+                double sum = 0;
+                for (double c : comparableCosines) sum += c;
+                double avgCosine = sum / comparableCosines.size();
+                // Gagal jika ada frame yang sangat jauh berbeda (< 0.55, indikasi swap wajah / orang lain),
+                // ATAU rata-rata kemiripan frame di bawah threshold.
+                if (minIdentityCosine < 0.55 || avgCosine < config.identityThreshold) {
+                    identityConsistent = false;
                 }
             }
         }
@@ -787,13 +816,19 @@ public class FaceRecognitionPlugin extends Plugin {
             float medianLiveScore = median(liveScores);
             int requiredVotes = (int) Math.ceil(frames.size() * 0.6);
 
-            // Challenge: deviasi yaw ≥ CHALLENGE_YAW_MIN ke arah yang diminta
-            int yawSign = config.yawSign;
+            // Challenge: deviasi yaw ≥ CHALLENGE_YAW_MIN ke arah yang diminta.
+            // yawSign menormalkan konvensi tanda pada nilai yaw SEBELUM agregasi
+            // min/max — menerapkannya ke min/max (bukan ke nilai yaw) membuat
+            // yawSign=-1 mustahil terpenuhi (minYaw ≥ 15 bertabrakan dengan syarat
+            // >= 2 frame frontal).
+            int yawSign = config.yawSign >= 0 ? 1 : -1;
+            float adjMinYaw = yawSign > 0 ? minYaw : -maxYaw;
+            float adjMaxYaw = yawSign > 0 ? maxYaw : -minYaw;
             boolean challengeSatisfied;
             if ("LOOK_LEFT".equals(challenge)) {
-                challengeSatisfied = (minYaw * yawSign) <= -CHALLENGE_YAW_MIN;
+                challengeSatisfied = adjMinYaw <= -CHALLENGE_YAW_MIN;
             } else {
-                challengeSatisfied = (maxYaw * yawSign) >= CHALLENGE_YAW_MIN;
+                challengeSatisfied = adjMaxYaw >= CHALLENGE_YAW_MIN;
             }
             challengeSatisfied = challengeSatisfied && frontalFrames >= CHALLENGE_MIN_FRONTAL_FRAMES;
 
@@ -804,10 +839,10 @@ public class FaceRecognitionPlugin extends Plugin {
                     && challengeSatisfied;
 
             if (passed) {
-                // verifikasi opsional terhadap referenceEmbedding (frame pertama)
-                if (referenceEmbedding != null && firstEmbedding != null) {
+                // verifikasi opsional terhadap referenceEmbedding (frame paling frontal)
+                if (referenceEmbedding != null && refEmbedding != null) {
                     JSONArray firstJson = new JSONArray();
-                    for (float v : firstEmbedding) firstJson.put(Double.valueOf(v));
+                    for (float v : refEmbedding) firstJson.put(Double.valueOf(v));
                     double score = cosineSimilarity(referenceEmbedding, firstJson);
                     if (Double.isNaN(score)) {
                         sink.reject("referenceEmbedding tidak valid (norma nol)");
@@ -821,7 +856,8 @@ public class FaceRecognitionPlugin extends Plugin {
                     match.put("thresholdVersion", MATCH_THRESHOLD_VERSION);
 
                     JSObject ret = buildSequenceResult(true, null, challenge, medianLiveScore,
-                            liveVotes, frames.size(), maxYaw, minYaw, frontalFrames, identityConsistent);
+                            liveVotes, frames.size(), maxYaw, minYaw, frontalFrames, identityConsistent,
+                            minIdentityCosine);
                     ret.put("match", match);
                     sink.resolve(ret);
                     return;
@@ -830,13 +866,14 @@ public class FaceRecognitionPlugin extends Plugin {
 
             String reason = failureReason;
             if (reason == null) {
-                if (!identityConsistent) reason = "IDENTITY_INCONSISTENT";
-                else if (!challengeSatisfied) reason = "CHALLENGE_FAILED";
+                if (!challengeSatisfied) reason = "CHALLENGE_FAILED";
                 else if (liveVotes < requiredVotes || medianLiveScore < config.liveThreshold) reason = "NOT_LIVE_ENOUGH";
+                else if (!identityConsistent) reason = "IDENTITY_INCONSISTENT";
             }
 
             sink.resolve(buildSequenceResult(passed, reason, challenge, medianLiveScore,
-                    liveVotes, frames.size(), maxYaw, minYaw, frontalFrames, identityConsistent));
+                    liveVotes, frames.size(), maxYaw, minYaw, frontalFrames, identityConsistent,
+                    minIdentityCosine));
 
         } catch (Exception e) {
             sink.reject("Gagal menjalankan verifyFaceSequence: " + e.getMessage());
@@ -846,7 +883,7 @@ public class FaceRecognitionPlugin extends Plugin {
     private JSObject buildSequenceResult(boolean passed, String reason, String challenge,
                                          float medianLiveScore, int liveVotes, int frameCount,
                                          float maxYaw, float minYaw, int frontalFrames,
-                                         boolean identityConsistent) {
+                                         boolean identityConsistent, Double minIdentityCosine) {
         JSObject ret = new JSObject();
         ret.put("passed", passed);
         if (reason != null) ret.put("reason", reason);
@@ -858,6 +895,8 @@ public class FaceRecognitionPlugin extends Plugin {
         ret.put("minYaw", minYaw);
         ret.put("frontalFrames", frontalFrames);
         ret.put("identityConsistent", identityConsistent);
+        // Diagnostik kalibrasi: cosine minimum antar frame sebanding (null jika < 2)
+        ret.put("minIdentityCosine", minIdentityCosine != null ? minIdentityCosine : JSONObject.NULL);
         ret.put("thresholdVersion", THRESHOLD_VERSION);
         return ret;
     }
@@ -1532,6 +1571,7 @@ public class FaceRecognitionPlugin extends Plugin {
         float blurMin = BLUR_MIN;
         float exposureMin = EXPOSURE_MIN;
         float exposureMax = EXPOSURE_MAX;
+        float identityThreshold = IDENTITY_CONSISTENCY;
         int yawSign = 1;
         boolean debug = false;
 
@@ -1557,6 +1597,7 @@ public class FaceRecognitionPlugin extends Plugin {
             c.blurMin        = (float) config.optDouble("blurMin",        c.blurMin);
             c.exposureMin    = (float) config.optDouble("exposureMin",    c.exposureMin);
             c.exposureMax    = (float) config.optDouble("exposureMax",    c.exposureMax);
+            c.identityThreshold = (float) config.optDouble("identityThreshold", c.identityThreshold);
             c.yawSign        = config.optInt("yawSign", 1);
             c.debug          = config.optBoolean("debug", false) && debugAllowed;
             return c;

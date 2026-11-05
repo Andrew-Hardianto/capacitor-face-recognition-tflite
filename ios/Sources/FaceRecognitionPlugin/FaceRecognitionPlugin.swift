@@ -82,7 +82,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     private let exposureMin: Float = 60
     private let exposureMax: Float = 200
     // Konsistensi identitas antar frame (verifyFaceSequence)
-    private let identityConsistency: Double = 0.8
+    private let identityMaxPose: Float = 12
     // Active challenge
     private let challengeYawMin: Float = 15
     private let challengeFrontMax: Float = 15
@@ -595,7 +595,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     ///   - SEMUA frame lolos quality gate
     ///   - median liveScore ≥ liveThreshold DAN mayoritas frame isLive (voting,
     ///     BUKAN "semua frame harus live" — lihat catatan BPCER di plan)
-    ///   - identitas konsisten antar frame (cosine ≥ 0.8 terhadap frame pertama)
+    ///   - identitas konsisten antar frame sebanding (cosine ≥ identityThreshold
+    ///     terhadap frame paling frontal; frame dengan |yaw| > 20° dikecualikan)
     ///   - challenge terpenuhi: yaw menyimpang ≥ 15° ke arah yang diminta, lalu
     ///     minimal 2 frame kembali mendekati frontal (|yaw| < 15°)
     ///
@@ -699,26 +700,45 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     /// dipakai ulang oleh captureLivenessSession (Fase 4).
     private func finishSequence(frames: [FrameResult], config: GateConfig,
                                 challenge: String, referenceEmbedding: [Double]?) -> [String: Any] {
-        var firstEmbedding: [Float]? = nil
-        var identityConsistent = true
         var failureReason: String? = nil
 
+        // SEMUA frame harus lolos quality gate
         for fr in frames {
-            // SEMUA frame harus lolos quality gate
             if !fr.quality.passed {
                 failureReason = "QUALITY_FAILED"
                 break
             }
+        }
 
-            // Konsistensi identitas terhadap frame pertama
-            if let embedding = fr.embedding {
-                if firstEmbedding == nil {
-                    firstEmbedding = embedding
-                } else if let cos = cosineSimilarity(firstEmbedding!.map { Double($0) },
-                                                     embedding.map { Double($0) }) {
-                    if cos < identityConsistency {
-                        identityConsistent = false
+        // Referensi identitas = frame PALING FRONTAL (|yaw| terkecil), bukan frame
+        // pertama — embedding paling frontal paling stabil untuk pembanding.
+        let refFrame: FrameResult? = failureReason == nil
+            ? frames.filter { $0.embedding != nil }.min(by: { abs($0.yaw) < abs($1.yaw) })
+            : nil
+        let refEmbedding = refFrame?.embedding
+
+        // Konsistensi identitas: hanya bandingkan frame "sebanding" (|yaw| <=
+        // identityMaxPose). Frame dengan pose berat tugasnya membuktikan challenge;
+        // embedding-nya tidak pose-invariant dan tidak boleh mematikan sesi.
+        var identityConsistent = true
+        var minIdentityCosine: Double? = nil
+        if failureReason == nil, let ref = refEmbedding, let refIndex = refFrame?.index {
+            var comparableCosines: [Double] = []
+            for fr in frames {
+                guard let embedding = fr.embedding, fr.index != refIndex else { continue }
+                guard abs(fr.yaw) <= identityMaxPose else { continue }
+                if let cos = cosineSimilarity(ref.map { Double($0) }, embedding.map { Double($0) }) {
+                    comparableCosines.append(cos)
+                    if minIdentityCosine == nil || cos < minIdentityCosine! {
+                        minIdentityCosine = cos
                     }
+                }
+            }
+            if !comparableCosines.isEmpty {
+                let avg = comparableCosines.reduce(0, +) / Double(comparableCosines.count)
+                let minCos = minIdentityCosine ?? 1.0
+                if minCos < 0.55 || avg < config.identityThreshold {
+                    identityConsistent = false
                 }
             }
         }
@@ -734,13 +754,19 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         let medianLiveScore = median(liveScores)
         let requiredVotes = Int(ceil(Double(frames.count) * 0.6))
 
-        // Challenge: deviasi yaw ≥ challengeYawMin ke arah yang diminta
-        let yawSign = Float(config.yawSign)
+        // Challenge: deviasi yaw ≥ challengeYawMin ke arah yang diminta.
+        // yawSign menormalkan konvensi tanda pada nilai yaw SEBELUM agregasi
+        // min/max — menerapkannya ke min/max (bukan ke nilai yaw) membuat
+        // yawSign=-1 mustahil terpenuhi (minYaw ≥ 15 bertabrakan dengan syarat
+        // >= 2 frame frontal).
+        let yawSign: Float = config.yawSign >= 0 ? 1 : -1
+        let adjMinYaw = yawSign > 0 ? minYaw : -maxYaw
+        let adjMaxYaw = yawSign > 0 ? maxYaw : -minYaw
         var challengeSatisfied: Bool
         if challenge == "LOOK_LEFT" {
-            challengeSatisfied = (minYaw * yawSign) <= -challengeYawMin
+            challengeSatisfied = adjMinYaw <= -challengeYawMin
         } else {
-            challengeSatisfied = (maxYaw * yawSign) >= challengeYawMin
+            challengeSatisfied = adjMaxYaw >= challengeYawMin
         }
         challengeSatisfied = challengeSatisfied && frontalFrames >= challengeMinFrontalFrames
 
@@ -754,10 +780,10 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             passed: passed, reason: nil, challenge: challenge,
             medianLiveScore: medianLiveScore, liveVotes: liveVotes, frameCount: frames.count,
             maxYaw: maxYaw, minYaw: minYaw, frontalFrames: frontalFrames,
-            identityConsistent: identityConsistent)
+            identityConsistent: identityConsistent, minIdentityCosine: minIdentityCosine)
 
-        if passed, let ref = referenceEmbedding, let first = firstEmbedding {
-            if let score = cosineSimilarity(ref, first.map { Double($0) }) {
+        if passed, let ref = referenceEmbedding, let best = refEmbedding {
+            if let score = cosineSimilarity(ref, best.map { Double($0) }) {
                 ret["match"] = [
                     "isMatch": score > matchThreshold,
                     "score": score,
@@ -770,12 +796,12 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         if !passed {
             var reason = failureReason
             if reason == nil {
-                if !identityConsistent {
-                    reason = "IDENTITY_INCONSISTENT"
-                } else if !challengeSatisfied {
+                if !challengeSatisfied {
                     reason = "CHALLENGE_FAILED"
                 } else if liveVotes < requiredVotes || medianLiveScore < config.liveThreshold {
                     reason = "NOT_LIVE_ENOUGH"
+                } else if !identityConsistent {
+                    reason = "IDENTITY_INCONSISTENT"
                 }
             }
             ret["reason"] = reason ?? "UNKNOWN"
@@ -787,7 +813,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     private func buildSequenceResult(passed: Bool, reason: String?, challenge: String,
                                      medianLiveScore: Float, liveVotes: Int, frameCount: Int,
                                      maxYaw: Float, minYaw: Float, frontalFrames: Int,
-                                     identityConsistent: Bool) -> [String: Any] {
+                                     identityConsistent: Bool,
+                                     minIdentityCosine: Double?) -> [String: Any] {
         var ret: [String: Any] = [
             "passed": passed,
             "challenge": challenge,
@@ -798,6 +825,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             "minYaw": minYaw,
             "frontalFrames": frontalFrames,
             "identityConsistent": identityConsistent,
+            // Diagnostik kalibrasi: cosine minimum antar frame sebanding (null jika < 2)
+            "minIdentityCosine": minIdentityCosine ?? NSNull(),
             "thresholdVersion": thresholdVersion,
         ]
         if let reason = reason {
@@ -1451,6 +1480,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         var blurMin: Float = 50
         var exposureMin: Float = 60
         var exposureMax: Float = 200
+        var identityThreshold: Double = 0.70
         var yawSign: Int = 1
         var debug: Bool = false
 
@@ -1473,6 +1503,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             if let v = config["blurMin"] as? Double { c.blurMin = Float(v) }
             if let v = config["exposureMin"] as? Double { c.exposureMin = Float(v) }
             if let v = config["exposureMax"] as? Double { c.exposureMax = Float(v) }
+            if let v = config["identityThreshold"] as? Double { c.identityThreshold = v }
             if let v = config["yawSign"] as? Int { c.yawSign = v }
             if let v = config["debug"] as? Bool { c.debug = v && debugAllowed }
             return c
