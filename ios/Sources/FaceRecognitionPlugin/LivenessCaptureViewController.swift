@@ -9,11 +9,17 @@ import UIKit
 /// FaceRecognitionPlugin terhadap frame-file ini.
 final class LivenessCaptureViewController: UIViewController, AVCapturePhotoCaptureDelegate {
 
+    /// Satu frame hasil capture beserta waktu capture-nya (epoch ms).
+    struct CapturedFrame {
+        let url: URL
+        let timestampMs: Double
+    }
+
     private let challenge: String
     private let frameCount: Int
     private let interval: TimeInterval
     private let warmup: TimeInterval
-    private let completion: (Result<[URL], Error>) -> Void
+    private let completion: (Result<[CapturedFrame], Error>) -> Void
 
     private let captureSession = AVCaptureSession()
     private let photoOutput = AVCapturePhotoOutput()
@@ -21,7 +27,7 @@ final class LivenessCaptureViewController: UIViewController, AVCapturePhotoCaptu
     private let instructionLabel = UILabel()
     private let progressLabel = UILabel()
 
-    private var capturedURLs: [URL] = []
+    private var capturedFrames: [CapturedFrame] = []
     private var warmupTimer: Timer?
     private var captureTimer: Timer?
     private var finished = false
@@ -30,18 +36,20 @@ final class LivenessCaptureViewController: UIViewController, AVCapturePhotoCaptu
         case cameraUnavailable
         case photoFailed
         case writeFailed
+        case invalidChallenge
 
         var errorDescription: String? {
             switch self {
             case .cameraUnavailable: return "Kamera depan tidak tersedia"
             case .photoFailed: return "Gagal mengambil frame"
             case .writeFailed: return "Gagal menyimpan frame"
+            case .invalidChallenge: return "Challenge tidak dikenal"
             }
         }
     }
 
     init(challenge: String, frameCount: Int, interval: TimeInterval, warmup: TimeInterval,
-         completion: @escaping (Result<[URL], Error>) -> Void) {
+         completion: @escaping (Result<[CapturedFrame], Error>) -> Void) {
         self.challenge = challenge
         self.frameCount = max(2, frameCount)
         self.interval = interval
@@ -58,6 +66,14 @@ final class LivenessCaptureViewController: UIViewController, AVCapturePhotoCaptu
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
+        // FAIL-CLOSED: challenge tak dikenal tidak boleh diam-diam memakai
+        // instruksi default — sesi dibatalkan sebelum kamera dibuka.
+        guard challenge == "LOOK_LEFT" || challenge == "LOOK_RIGHT" else {
+            DispatchQueue.main.async { [weak self] in
+                self?.finish(.failure(CaptureError.invalidChallenge))
+            }
+            return
+        }
         setupLabels()
         configureSession()
     }
@@ -68,9 +84,17 @@ final class LivenessCaptureViewController: UIViewController, AVCapturePhotoCaptu
     }
 
     private func setupLabels() {
-        let instruction = challenge == "LOOK_LEFT"
-            ? "TOLEH KE KIRI perlahan, lalu kembali lurus"
-            : "TOLEH KE KANAN perlahan, lalu kembali lurus"
+        // FAIL-CLOSED: mapping eksplisit per challenge — nilai tak dikenal sudah
+        // ditolak di viewDidLoad, TIDAK ada default diam-diam ke "ke kanan".
+        let instruction: String
+        switch challenge {
+        case "LOOK_LEFT":
+            instruction = "TOLEH KE KIRI ANDA (dagu ke bahu kiri) perlahan, lalu kembali lurus"
+        case "LOOK_RIGHT":
+            instruction = "TOLEH KE KANAN ANDA (dagu ke bahu kanan) perlahan, lalu kembali lurus"
+        default:
+            instruction = ""
+        }
 
         instructionLabel.text = instruction
         instructionLabel.textColor = .white
@@ -158,9 +182,10 @@ final class LivenessCaptureViewController: UIViewController, AVCapturePhotoCaptu
             .appendingPathComponent("liveness_frames", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let url = dir.appendingPathComponent("frame_\(capturedURLs.count).jpg")
+            let url = dir.appendingPathComponent("frame_\(capturedFrames.count).jpg")
             try data.write(to: url)
-            capturedURLs.append(url)
+            capturedFrames.append(CapturedFrame(
+                url: url, timestampMs: Date().timeIntervalSince1970 * 1000))
         } catch {
             finish(.failure(CaptureError.writeFailed))
             return
@@ -168,9 +193,9 @@ final class LivenessCaptureViewController: UIViewController, AVCapturePhotoCaptu
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.progressLabel.text = "Mengambil frame \(self.capturedURLs.count)/\(self.frameCount)"
-            if self.capturedURLs.count >= self.frameCount {
-                self.finish(.success(self.capturedURLs))
+            self.progressLabel.text = "Mengambil frame \(self.capturedFrames.count)/\(self.frameCount)"
+            if self.capturedFrames.count >= self.frameCount {
+                self.finish(.success(self.capturedFrames))
             } else {
                 self.captureTimer = Timer.scheduledTimer(
                     withTimeInterval: self.interval, repeats: false) { [weak self] _ in
@@ -180,7 +205,7 @@ final class LivenessCaptureViewController: UIViewController, AVCapturePhotoCaptu
         }
     }
 
-    private func finish(_ result: Result<[URL], Error>) {
+    private func finish(_ result: Result<[CapturedFrame], Error>) {
         guard !finished else { return }
         finished = true
         DispatchQueue.main.async { [weak self] in

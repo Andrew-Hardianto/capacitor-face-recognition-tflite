@@ -108,14 +108,25 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
     throw new Error('verifyFace hanya berjalan di Android & iOS native.');
   }
 
-  async getLivenessChallenge(): Promise<{ challenge: ChallengeType }> {
+  async createChallengeSession(): Promise<{
+    challengeId: string;
+    challenge: ChallengeType;
+    expiresAt: number;
+  }> {
+    console.warn('createChallengeSession hanya berjalan penuh di Android & iOS native.');
     const challenge: ChallengeType = Math.random() < 0.5 ? 'LOOK_LEFT' : 'LOOK_RIGHT';
-    return { challenge };
+    return {
+      challengeId: typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      challenge,
+      expiresAt: Date.now() + 60_000,
+    };
   }
 
   async verifyFaceSequence(_options: {
     images: string[];
-    challenge: ChallengeType;
+    challengeId: string;
     referenceEmbedding?: number[];
   }): Promise<VerifyFaceSequenceResult> {
     // FAIL-CLOSED: jangan pernah mengembalikan passed true dari web
@@ -123,7 +134,6 @@ export class FaceRecognitionWeb extends WebPlugin implements FaceRecognitionPlug
   }
 
   async captureLivenessSession(_options: {
-    challenge?: ChallengeType;
     referenceEmbedding?: number[];
   }): Promise<NativeSessionResult> {
     // FAIL-CLOSED: native capture hanya tersedia di Android & iOS

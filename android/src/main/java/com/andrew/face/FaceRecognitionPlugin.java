@@ -35,6 +35,7 @@ import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 @CapacitorPlugin(
     name = "FaceRecognition",
@@ -91,7 +92,7 @@ public class FaceRecognitionPlugin extends Plugin {
     private static final float LIVE_THRESHOLD = 0.80f;
     private static final float SPOOF_VETO = 0.20f;
     // Versi threshold — disertakan di setiap hasil agar perubahan semantik terlacak
-    private static final String THRESHOLD_VERSION = "liveness-v2";
+    private static final String THRESHOLD_VERSION = "liveness-v3";
     private static final String MATCH_THRESHOLD_VERSION = "match-v1";
 
     // ============================
@@ -108,9 +109,14 @@ public class FaceRecognitionPlugin extends Plugin {
     private static final float IDENTITY_CONSISTENCY = 0.70f; // default 0.70 (sebelumnya 0.8f terlalu ketat untuk mobile camera)
     private static final float IDENTITY_MAX_POSE = 12f;     // hanya frame frontal (|yaw| <= 12°) yang dicek identitasnya; frame menoleh tugasnya challenge
     // Active challenge
-    private static final float CHALLENGE_YAW_MIN = 15f;     // deviasi minimum yang diwajibkan
-    private static final float CHALLENGE_FRONT_MAX = 15f;   // kembali mendekati frontal
-    private static final int CHALLENGE_MIN_FRONTAL_FRAMES = 2;
+    // CATATAN KONVENSI (liveness-v3): yaw ternormalisasi di sumber pengukuran
+    // (YawConvention) — positif = user menoleh ke kanan anatomisnya.
+    // LOOK_LEFT butuh deviasi yaw NEGATIF; LOOK_RIGHT positif.
+    // Threshold aturan lintasan (R1–R5) ada di ChallengeTrajectory.Thresholds.
+    private static final float CHALLENGE_FRONT_MAX = 15f;   // pelaporan field frontalFrames
+    // Challenge session (P0): challenge dikeluarkan native, single-use + expiry.
+    // JS tidak bisa memilih arah challenge — lihat createChallengeSession.
+    private static final long CHALLENGE_TTL_MS = 60 * 1000L;
 
     // ============================
     // Pertahanan berlapis (Fase 4)
@@ -119,10 +125,21 @@ public class FaceRecognitionPlugin extends Plugin {
     private static final int MAX_SESSION_ATTEMPTS = 10;
     private static final long SESSION_ATTEMPT_WINDOW_MS = 5 * 60 * 1000L;
     private static final List<Long> sessionAttempts = new ArrayList<>();
+    // Anti-replay (P2): veto per-frame + timing sesi
+    // spoofHardVeto: satu frame dengan label spoof (PRINT/REPLAY) atau
+    //   spoofScore >= veto ini → sesi GAGAL (SPOOF_FRAME_DETECTED), tanpa toleransi voting.
+    private static final float SPOOF_HARD_VETO = 0.5f;
+    // Rentang durasi sesi yang wajar untuk gerakan manusia (12 frame @ ~120ms).
+    // Ambang atas 5s (bukan 3s seperti plan) untuk toleransi latensi capture
+    // perangkat lambat — capture berantai mengukur interval SETELAH frame selesai.
+    private static final double SESSION_DURATION_MIN_MS = 1000;
+    private static final double SESSION_DURATION_MAX_MS = 5000;
     // Native capture — captureLivenessSession
     private static final int REQUEST_LIVENESS_SESSION = 4321;
-    private static final int NATIVE_FRAME_COUNT = 5;
-    private static final long NATIVE_FRAME_INTERVAL_MS = 300L;
+    // P1: sampling lebih rapat agar lintasan gerakan terukur (fallback perangkat
+    // lambat: turunkan ke 10 frame @ 150ms)
+    private static final int NATIVE_FRAME_COUNT = 12;
+    private static final long NATIVE_FRAME_INTERVAL_MS = 120L;
     private static final long NATIVE_WARMUP_MS = 1200L;
 
     // ============================
@@ -359,7 +376,7 @@ public class FaceRecognitionPlugin extends Plugin {
 
                             // Head euler angles (derajat, sesuai dokumentasi ML Kit)
                             faceObj.put("headEulerAngleX", face.getHeadEulerAngleX()); // pitch (atas-bawah)
-                            faceObj.put("headEulerAngleY", face.getHeadEulerAngleY()); // yaw (kiri-kanan)
+                            faceObj.put("headEulerAngleY", YawConvention.normalize(face.getHeadEulerAngleY())); // yaw ternormalisasi (positif = kanan anatomis)
                             faceObj.put("headEulerAngleZ", face.getHeadEulerAngleZ()); // roll (miring)
 
                             // Eye open probability (0.0 = tutup, 1.0 = buka penuh)
@@ -588,17 +605,86 @@ public class FaceRecognitionPlugin extends Plugin {
     }
 
     // ============================
-    // Active challenge (Fase 3.3)
+    // Active challenge (Fase 3.3, liveness-v3)
     // ============================
+    // Challenge SELALU dibuat native (acak) dan berlaku single-use + expiry.
+    // verifyFaceSequence membaca arah challenge dari session ini, BUKAN dari
+    // input JS — menutup celah "kirim challenge yang cocok dengan video".
+    private ChallengeSession activeChallenge;
+
+    /** Challenge session aktif: acak, single-use, dengan expiry. */
+    private static final class ChallengeSession {
+        final String id;
+        final String challenge;
+        final long expiresAt;
+        boolean consumed;
+
+        ChallengeSession(String id, String challenge, long expiresAt) {
+            this.id = id;
+            this.challenge = challenge;
+            this.expiresAt = expiresAt;
+        }
+    }
+
+    /** Hasil lookup challenge session — status membedakan alasan reject. */
+    private static final class ChallengeLookup {
+        enum Status { OK, MISSING, EXPIRED, CONSUMED }
+
+        final Status status;
+        final String challenge;
+
+        private ChallengeLookup(Status status, String challenge) {
+            this.status = status;
+            this.challenge = challenge;
+        }
+
+        static ChallengeLookup ok(String challenge) { return new ChallengeLookup(Status.OK, challenge); }
+        static ChallengeLookup missing() { return new ChallengeLookup(Status.MISSING, null); }
+        static ChallengeLookup expired() { return new ChallengeLookup(Status.EXPIRED, null); }
+        static ChallengeLookup consumed() { return new ChallengeLookup(Status.CONSUMED, null); }
+    }
+
+    /** Membuat challenge session baru (acak) — menggantikan yang lama. */
+    private synchronized ChallengeSession issueChallengeSession() {
+        String challenge = Math.random() < 0.5 ? "LOOK_LEFT" : "LOOK_RIGHT";
+        activeChallenge = new ChallengeSession(
+                UUID.randomUUID().toString(), challenge,
+                System.currentTimeMillis() + CHALLENGE_TTL_MS);
+        return activeChallenge;
+    }
+
     /**
-     * Mengeluarkan challenge acak untuk sesi liveness aktif.
-     * Aplikasi menampilkan instruksi ke user, lalu memanggil verifyFaceSequence.
+     * Mengambil SEKALIGUS mengonsumsi challenge session untuk {@code id}.
+     * Percobaan pertama (gagal maupun lulus) memakai sesi — brute-force retry
+     * dengan challenge yang sama tidak mungkin.
+     */
+    private synchronized ChallengeLookup consumeChallengeSession(String id) {
+        if (id == null || id.isEmpty() || activeChallenge == null || !activeChallenge.id.equals(id)) {
+            return ChallengeLookup.missing();
+        }
+        long now = System.currentTimeMillis();
+        if (now > activeChallenge.expiresAt) return ChallengeLookup.expired();
+        if (activeChallenge.consumed) return ChallengeLookup.consumed();
+        activeChallenge.consumed = true;
+        return ChallengeLookup.ok(activeChallenge.challenge);
+    }
+
+    /**
+     * Membuat challenge session (acak, single-use, expiry 60 detik).
+     * Aplikasi menampilkan instruksi ke user, lalu memanggil verifyFaceSequence
+     * dengan {@code challengeId} yang dikembalikan. Challenge TIDAK bisa dipilih dari JS.
      */
     @PluginMethod
-    public void getLivenessChallenge(PluginCall call) {
-        String challenge = Math.random() < 0.5 ? "LOOK_LEFT" : "LOOK_RIGHT";
+    public void createChallengeSession(PluginCall call) {
+        if (!checkRateLimit()) {
+            call.reject("Terlalu banyak percobaan sesi liveness. Coba lagi dalam beberapa menit.", "RATE_LIMITED");
+            return;
+        }
+        ChallengeSession session = issueChallengeSession();
         JSObject ret = new JSObject();
-        ret.put("challenge", challenge);
+        ret.put("challengeId", session.id);
+        ret.put("challenge", session.challenge);
+        ret.put("expiresAt", (double) session.expiresAt);
         call.resolve(ret);
     }
 
@@ -607,7 +693,7 @@ public class FaceRecognitionPlugin extends Plugin {
      *
      * options:
      *   images: string[]            → ≥ 5 frame dalam ~1,5 detik
-     *   challenge: 'LOOK_LEFT' | 'LOOK_RIGHT'
+     *   challengeId: string         → dari createChallengeSession (single-use)
      *   referenceEmbedding?: number[]
      *   config?: GateConfig (sama dengan verifyFace)
      *
@@ -620,9 +706,10 @@ public class FaceRecognitionPlugin extends Plugin {
      *   - challenge terpenuhi: yaw menyimpang ≥ 15° ke arah yang diminta, lalu
      *     minimal 2 frame kembali mendekati frontal (|yaw| < 15°)
      *
-     * CATATAN KONVENSI TANDA YAW: default saat ini LOOK_LEFT = yaw negatif.
-     * Jika di perangkat ternyata terbalik, set config.yawSign = -1.
-     * Verifikasi tanda ini bagian dari kalibrasi Fase 5.
+     * CATATAN KONVENSI YAW (liveness-v3): yaw ternormalisasi di sumber
+     * (YawConvention) — positif = menoleh ke kanan anatomis user. LOOK_LEFT
+     * butuh deviasi yaw negatif. Perangkat dengan buffer ter-flip:
+     * set config.yawSignOverride = -1.
      */
     @PluginMethod
     public void verifyFaceSequence(PluginCall call) {
@@ -630,22 +717,39 @@ public class FaceRecognitionPlugin extends Plugin {
             call.reject("Model liveness atau face recognition tidak ditemukan di assets");
             return;
         }
-
-        if (!checkRateLimit()) {
-            call.reject("Terlalu banyak percobaan sesi liveness. Coba lagi dalam beberapa menit.", "RATE_LIMITED");
+        // P2.4: jalur frame base64 dari JS = celah injeksi frame — hanya untuk
+        // build debug ATAU saat app meng-enable flag `enableInsecureFramePath`
+        // (lihat isInsecureFramePathAllowed). Produksi yang memungkinkan sebaiknya
+        // memakai captureLivenessSession.
+        if (!isInsecureFramePathAllowed()) {
+            call.reject("verifyFaceSequence (frame base64 dari JS) hanya untuk build debug atau app dengan flag enableInsecureFramePath — "
+                    + "gunakan captureLivenessSession di produksi", "INSECURE_FRAME_PATH_DISABLED");
             return;
         }
 
         JSONArray imagesJson = call.getArray("images");
-        String challenge = call.getString("challenge");
         if (imagesJson == null || imagesJson.length() < 2) {
             call.reject("images minimal berisi 2 frame (disarankan ≥ 5)");
             return;
         }
-        if (!"LOOK_LEFT".equals(challenge) && !"LOOK_RIGHT".equals(challenge)) {
-            call.reject("challenge harus LOOK_LEFT atau LOOK_RIGHT (dari getLivenessChallenge)");
-            return;
+        // Challenge dibaca dari session native (acak, single-use, expiry) —
+        // BUKAN dari input JS. Percobaan pertama langsung mengonsumsi sesi.
+        final String challengeId = call.getString("challengeId");
+        ChallengeLookup lookup = consumeChallengeSession(challengeId);
+        switch (lookup.status) {
+            case MISSING:
+                call.reject("challengeId tidak dikenal — panggil createChallengeSession dulu", "CHALLENGE_NOT_FOUND");
+                return;
+            case EXPIRED:
+                call.reject("Challenge session kedaluwarsa — buat challenge baru", "CHALLENGE_EXPIRED");
+                return;
+            case CONSUMED:
+                call.reject("Challenge session sudah dipakai — buat challenge baru", "CHALLENGE_CONSUMED");
+                return;
+            case OK:
+                break;
         }
+        String challenge = lookup.challenge;
 
         GateConfig config =
                 GateConfig.from(call.getObject("config"), DeviceIntegrity.isDebuggable(getContext()));
@@ -659,9 +763,9 @@ public class FaceRecognitionPlugin extends Plugin {
 
             // Proses frame SEKUENSIAL via rantai callback (aman dari deadlock,
             // listener ML Kit berjalan di main thread).
-            SequenceSink sink = pluginSink(call);
-            processFramesSequentially(sink, images, 0, config, challenge, referenceEmbedding,
-                    new ArrayList<FrameResult>());
+            SequenceSink sink = withChallengeId(pluginSink(call), challengeId);
+            processFramesSequentially(sink, images, 0, config, challenge, null,
+                    referenceEmbedding, new ArrayList<FrameResult>());
         } catch (Exception e) {
             call.reject("Gagal menjalankan verifyFaceSequence", e);
         }
@@ -687,9 +791,27 @@ public class FaceRecognitionPlugin extends Plugin {
         };
     }
 
+    /** Menambahkan challengeId + penanda jalur (native=false) ke hasil (kontrak liveness-v3). */
+    private SequenceSink withChallengeId(SequenceSink sink, String challengeId) {
+        return new SequenceSink() {
+            @Override
+            public void resolve(JSObject result) {
+                result.put("challengeId", challengeId);
+                result.put("native", false);
+                sink.resolve(result);
+            }
+
+            @Override
+            public void reject(String message) {
+                sink.reject(message);
+            }
+        };
+    }
+
     /** Callback per frame: menerima FrameResult lalu lanjut ke frame berikutnya. */
     private void processFramesSequentially(SequenceSink sink, List<String> images, int index,
                                            GateConfig config, String challenge,
+                                           double[] timestamps,
                                            JSONArray referenceEmbedding, List<FrameResult> frames) {
         if (index >= images.size()) {
             finishSequence(sink, frames, config, challenge, referenceEmbedding);
@@ -713,6 +835,9 @@ public class FaceRecognitionPlugin extends Plugin {
             .addOnSuccessListener(faces -> {
                 FrameResult fr = new FrameResult();
                 fr.index = index;
+                if (timestamps != null && index < timestamps.length) {
+                    fr.timestampMs = timestamps[index];
+                }
                 if (faces.isEmpty()) {
                     fr.quality = QualityResult.fail("NO_FACE", 0, 0);
                 } else {
@@ -720,7 +845,7 @@ public class FaceRecognitionPlugin extends Plugin {
                     if (fr.quality.passed) {
                         Face face = pickLargestFace(faces);
                         fr.bounds = face.getBoundingBox();
-                        fr.yaw = face.getHeadEulerAngleY();
+                        fr.yaw = YawConvention.normalize(face.getHeadEulerAngleY());
                         fr.pitch = face.getHeadEulerAngleX();
                         fr.roll = face.getHeadEulerAngleZ();
                         fr.liveness = runAntiSpoofPipeline(frameBitmap, fr.bounds, config);
@@ -729,15 +854,18 @@ public class FaceRecognitionPlugin extends Plugin {
                 }
                 frames.add(fr);
                 processFramesSequentially(sink, images, index + 1, config, challenge,
-                        referenceEmbedding, frames);
+                        timestamps, referenceEmbedding, frames);
             })
             .addOnFailureListener(e -> {
                 FrameResult fr = new FrameResult();
                 fr.index = index;
+                if (timestamps != null && index < timestamps.length) {
+                    fr.timestampMs = timestamps[index];
+                }
                 fr.quality = QualityResult.fail("NO_FACE", 0, 0);
                 frames.add(fr);
                 processFramesSequentially(sink, images, index + 1, config, challenge,
-                        referenceEmbedding, frames);
+                        timestamps, referenceEmbedding, frames);
             });
     }
 
@@ -798,82 +926,125 @@ public class FaceRecognitionPlugin extends Plugin {
             // ---- Agregasi (median + voting, BUKAN all-live) ----
             float[] liveScores = new float[frames.size()];
             int liveVotes = 0;
-            float maxYaw = Float.NEGATIVE_INFINITY;
-            float minYaw = Float.POSITIVE_INFINITY;
-            int frontalFrames = 0;
+            List<ChallengeTrajectory.Sample> yawSamples = new ArrayList<>();
 
             for (int i = 0; i < frames.size(); i++) {
                 FrameResult fr = frames.get(i);
                 liveScores[i] = fr.liveness != null ? fr.liveness.liveScore : 0f;
                 if (fr.liveness != null && fr.liveness.isLive) liveVotes++;
                 if (fr.quality.passed) {
-                    maxYaw = Math.max(maxYaw, fr.yaw);
-                    minYaw = Math.min(minYaw, fr.yaw);
-                    if (Math.abs(fr.yaw) < CHALLENGE_FRONT_MAX) frontalFrames++;
+                    // Yaw sudah ternormalisasi di sumber (YawConvention): positif =
+                    // menoleh ke kanan anatomis user. yawSignOverride hanya untuk
+                    // perangkat dengan buffer kamera ter-flip.
+                    yawSamples.add(new ChallengeTrajectory.Sample(
+                            YawConvention.applyOverride(fr.yaw, config.yawSignOverride),
+                            fr.timestampMs));
                 }
             }
 
-            float medianLiveScore = median(liveScores);
-            int requiredVotes = (int) Math.ceil(frames.size() * 0.6);
-
-            // Challenge: deviasi yaw ≥ CHALLENGE_YAW_MIN ke arah yang diminta.
-            // yawSign menormalkan konvensi tanda pada nilai yaw SEBELUM agregasi
-            // min/max — menerapkannya ke min/max (bukan ke nilai yaw) membuat
-            // yawSign=-1 mustahil terpenuhi (minYaw ≥ 15 bertabrakan dengan syarat
-            // >= 2 frame frontal).
-            int yawSign = config.yawSign >= 0 ? 1 : -1;
-            float adjMinYaw = yawSign > 0 ? minYaw : -maxYaw;
-            float adjMaxYaw = yawSign > 0 ? maxYaw : -minYaw;
-            boolean challengeSatisfied;
-            if ("LOOK_LEFT".equals(challenge)) {
-                challengeSatisfied = adjMinYaw <= -CHALLENGE_YAW_MIN;
-            } else {
-                challengeSatisfied = adjMaxYaw >= CHALLENGE_YAW_MIN;
+            float maxYaw = Float.NEGATIVE_INFINITY;
+            float minYaw = Float.POSITIVE_INFINITY;
+            int frontalFrames = 0;
+            for (ChallengeTrajectory.Sample s : yawSamples) {
+                maxYaw = Math.max(maxYaw, s.yaw);
+                minYaw = Math.min(minYaw, s.yaw);
+                if (Math.abs(s.yaw) < CHALLENGE_FRONT_MAX) frontalFrames++;
             }
-            challengeSatisfied = challengeSatisfied && frontalFrames >= CHALLENGE_MIN_FRONTAL_FRAMES;
+            if (yawSamples.isEmpty()) {
+                maxYaw = 0f;
+                minYaw = 0f;
+            }
+
+            float medianLiveScore = median(liveScores);
+            // P2.1: voting sesi diperketat — default SEMUA frame harus isLive.
+            int requiredVotes = (int) Math.ceil(frames.size() * config.minLiveVoteRatio);
+
+            // Challenge (P1): verifikasi LINTASAN TEMPORAL, bukan min/max agregat —
+            // frontal di awal → deviasi ≥ 15° ke arah challenge → kembali frontal,
+            // tanpa gerakan dua arah (head-shake), dengan gerakan halus.
+            // Lihat ChallengeTrajectory untuk aturan R1–R5.
+            ChallengeTrajectory.Result trajectory =
+                    ChallengeTrajectory.evaluate(yawSamples, challenge);
+            boolean challengeSatisfied = trajectory.passed;
+
+            // ---- Anti-replay (P2) ----
+            // P2.1: veto per-frame — satu frame dengan label spoof (PRINT/REPLAY)
+            // atau spoofScore >= SPOOF_HARD_VETO langsung menggagalkan sesi,
+            // TANPA toleransi voting.
+            boolean spoofFrameDetected = false;
+            float maxScreenSuspect = 0f;
+            for (FrameResult fr : frames) {
+                if (fr.liveness == null) continue;
+                if (!"LIVE".equals(fr.liveness.label) || fr.liveness.spoofScore >= SPOOF_HARD_VETO) {
+                    spoofFrameDetected = true;
+                }
+                maxScreenSuspect = Math.max(maxScreenSuspect, fr.liveness.screenSuspectScore);
+            }
+            // P2.2: veto screen-suspect hanya jika di-set eksplisit (mode ketat opt-in);
+            // default hanya dicatat sebagai soft signal untuk pengumpulan data.
+            boolean screenVetoTriggered = config.screenSuspectVeto != null
+                    && maxScreenSuspect >= config.screenSuspectVeto;
+            // P2.3: durasi sesi harus masuk rentang gerakan manusia
+            // (hanya diperiksa jika timestamp diketahui — jalur native capture).
+            boolean timingOk = trajectory.durationMs <= 0
+                    || (trajectory.durationMs >= SESSION_DURATION_MIN_MS
+                        && trajectory.durationMs <= SESSION_DURATION_MAX_MS);
 
             boolean passed = failureReason == null
+                    && !spoofFrameDetected
+                    && !screenVetoTriggered
+                    && timingOk
                     && medianLiveScore >= config.liveThreshold
                     && liveVotes >= requiredVotes
                     && identityConsistent
                     && challengeSatisfied;
 
-            if (passed) {
-                // verifikasi opsional terhadap referenceEmbedding (frame paling frontal)
-                if (referenceEmbedding != null && refEmbedding != null) {
-                    JSONArray firstJson = new JSONArray();
-                    for (float v : refEmbedding) firstJson.put(Double.valueOf(v));
-                    double score = cosineSimilarity(referenceEmbedding, firstJson);
-                    if (Double.isNaN(score)) {
-                        sink.reject("referenceEmbedding tidak valid (norma nol)");
-                        return;
-                    }
-                    // match dilaporkan; tidak menggagalkan sesi (keputusan ada di aplikasi)
-                    JSObject match = new JSObject();
-                    match.put("isMatch", score > MATCH_THRESHOLD);
-                    match.put("score", score);
-                    match.put("threshold", MATCH_THRESHOLD);
-                    match.put("thresholdVersion", MATCH_THRESHOLD_VERSION);
-
-                    JSObject ret = buildSequenceResult(true, null, challenge, medianLiveScore,
-                            liveVotes, frames.size(), maxYaw, minYaw, frontalFrames, identityConsistent,
-                            minIdentityCosine);
-                    ret.put("match", match);
-                    sink.resolve(ret);
-                    return;
-                }
-            }
-
             String reason = failureReason;
-            if (reason == null) {
-                if (!challengeSatisfied) reason = "CHALLENGE_FAILED";
+            if (reason == null && !passed) {
+                // Prioritas alasan gagal: spoof > screen > timing > challenge > votes > identitas
+                if (spoofFrameDetected) reason = "SPOOF_FRAME_DETECTED";
+                else if (screenVetoTriggered) reason = "SCREEN_SUSPECTED";
+                else if (!timingOk) reason = "TIMING_SUSPECT";
+                else if (!challengeSatisfied) reason = trajectory.failureReason != null ? trajectory.failureReason : "CHALLENGE_FAILED";
                 else if (liveVotes < requiredVotes || medianLiveScore < config.liveThreshold) reason = "NOT_LIVE_ENOUGH";
                 else if (!identityConsistent) reason = "IDENTITY_INCONSISTENT";
             }
 
-            sink.resolve(buildSequenceResult(passed, reason, challenge, medianLiveScore,
+            JSObject ret = buildSequenceResult(passed, reason, challenge, medianLiveScore,
                     liveVotes, frames.size(), maxYaw, minYaw, frontalFrames, identityConsistent,
-                    minIdentityCosine));
+                    minIdentityCosine, trajectory, maxScreenSuspect);
+
+            // Verifikasi opsional terhadap referenceEmbedding (frame paling frontal)
+            if (passed && referenceEmbedding != null && refEmbedding != null) {
+                JSONArray firstJson = new JSONArray();
+                for (float v : refEmbedding) firstJson.put(Double.valueOf(v));
+                double score = cosineSimilarity(referenceEmbedding, firstJson);
+                if (Double.isNaN(score)) {
+                    sink.reject("referenceEmbedding tidak valid (norma nol)");
+                    return;
+                }
+                // match dilaporkan; tidak menggagalkan sesi (keputusan ada di aplikasi)
+                JSObject match = new JSObject();
+                match.put("isMatch", score > MATCH_THRESHOLD);
+                match.put("score", score);
+                match.put("threshold", MATCH_THRESHOLD);
+                match.put("thresholdVersion", MATCH_THRESHOLD_VERSION);
+                ret.put("match", match);
+            }
+
+            if (config.debug) {
+                JSONArray trace = new JSONArray();
+                for (FrameResult fr : frames) {
+                    JSObject entry = new JSObject();
+                    entry.put("index", fr.index);
+                    entry.put("yaw", YawConvention.applyOverride(fr.yaw, config.yawSignOverride));
+                    if (fr.timestampMs >= 0) entry.put("timestampMs", fr.timestampMs);
+                    trace.put(entry);
+                }
+                ret.put("yawTrace", trace);
+            }
+
+            sink.resolve(ret);
 
         } catch (Exception e) {
             sink.reject("Gagal menjalankan verifyFaceSequence: " + e.getMessage());
@@ -883,7 +1054,9 @@ public class FaceRecognitionPlugin extends Plugin {
     private JSObject buildSequenceResult(boolean passed, String reason, String challenge,
                                          float medianLiveScore, int liveVotes, int frameCount,
                                          float maxYaw, float minYaw, int frontalFrames,
-                                         boolean identityConsistent, Double minIdentityCosine) {
+                                         boolean identityConsistent, Double minIdentityCosine,
+                                         ChallengeTrajectory.Result trajectory,
+                                         float maxScreenSuspect) {
         JSObject ret = new JSObject();
         ret.put("passed", passed);
         if (reason != null) ret.put("reason", reason);
@@ -897,8 +1070,33 @@ public class FaceRecognitionPlugin extends Plugin {
         ret.put("identityConsistent", identityConsistent);
         // Diagnostik kalibrasi: cosine minimum antar frame sebanding (null jika < 2)
         ret.put("minIdentityCosine", minIdentityCosine != null ? minIdentityCosine : JSONObject.NULL);
+        // Ringkasan lintasan challenge (P1): R1–R5 + statistik yaw
+        ret.put("trajectory", trajectoryToJson(trajectory));
+        // Sinyal artefak layar agregat (P2.2) — soft signal kecuali screenSuspectVeto di-set
+        ret.put("screenSuspect", maxScreenSuspect);
         ret.put("thresholdVersion", THRESHOLD_VERSION);
         return ret;
+    }
+
+    private JSObject trajectoryToJson(ChallengeTrajectory.Result t) {
+        JSObject rules = new JSObject();
+        rules.put("frontalStart", t.frontalStart);
+        rules.put("deviation", t.deviation);
+        rules.put("returnFrontal", t.returnFrontal);
+        rules.put("singleDirection", t.singleDirection);
+        rules.put("smoothMotion", t.smoothMotion);
+
+        JSObject o = new JSObject();
+        o.put("startYaw", t.startYaw);
+        o.put("endYaw", t.endYaw);
+        o.put("extremeYaw", t.extremeYaw);
+        o.put("extremeFrame", t.extremeFrame);
+        o.put("wrongWayMax", t.wrongWayObserved);
+        o.put("deltaVariance", t.deltaVariance);
+        o.put("tooSmooth", t.tooSmooth);
+        o.put("durationMs", t.durationMs);
+        o.put("rulesPassed", rules);
+        return o;
     }
 
     // ============================
@@ -911,10 +1109,10 @@ public class FaceRecognitionPlugin extends Plugin {
      * tersebut. Yang kembali ke JS hanya HASIL — bukan frame mentah.
      *
      * options:
-     *   challenge?: 'LOOK_LEFT' | 'LOOK_RIGHT'  → default acak
      *   referenceEmbedding?: number[]
      *   config?: LivenessConfig
      *
+     * Challenge SELALU dibuat internal (acak) — caller tidak bisa memilih arah.
      * Response = VerifyFaceSequenceResult + { native, deviceIntegrity, auditId }
      */
     @PluginMethod
@@ -947,10 +1145,9 @@ public class FaceRecognitionPlugin extends Plugin {
     }
 
     private void startLivenessSession(PluginCall call) {
-        String challenge = call.getString("challenge");
-        if (!"LOOK_LEFT".equals(challenge) && !"LOOK_RIGHT".equals(challenge)) {
-            challenge = Math.random() < 0.5 ? "LOOK_LEFT" : "LOOK_RIGHT";
-        }
+        // Challenge SELALU acak dari native — menutup brute-force
+        // "ulangi sesi sampai challenge cocok dengan video yang disiapkan".
+        String challenge = Math.random() < 0.5 ? "LOOK_LEFT" : "LOOK_RIGHT";
 
         saveCall(call);
         Intent intent = LivenessCaptureActivity.createIntent(
@@ -976,6 +1173,8 @@ public class FaceRecognitionPlugin extends Plugin {
         String challenge = data.getStringExtra(LivenessCaptureActivity.EXTRA_CHALLENGE);
         ArrayList<String> framePaths =
                 data.getStringArrayListExtra(LivenessCaptureActivity.EXTRA_FRAME_PATHS);
+        double[] frameTimestamps =
+                data.getDoubleArrayExtra(LivenessCaptureActivity.EXTRA_FRAME_TIMESTAMPS);
         freeSavedCall();
 
         if (framePaths == null || framePaths.isEmpty()) {
@@ -997,7 +1196,8 @@ public class FaceRecognitionPlugin extends Plugin {
             JSONArray referenceEmbedding = call.getArray("referenceEmbedding");
 
             processFramesSequentially(nativeSessionSink(call, frameBytes),
-                    frames, 0, config, challenge, referenceEmbedding, new ArrayList<FrameResult>());
+                    frames, 0, config, challenge, frameTimestamps,
+                    referenceEmbedding, new ArrayList<FrameResult>());
         } catch (Exception e) {
             deleteFrameFiles();
             call.reject("Gagal memproses frame capture: " + e.getMessage());
@@ -1079,6 +1279,17 @@ public class FaceRecognitionPlugin extends Plugin {
         }
     }
 
+    /**
+     * P2.4: jalur frame base64 dari JS (verifyFaceSequence) adalah celah injeksi
+     * frame — hanya untuk build DEBUG, ATAU saat app secara eksplisit meng-enable
+     * flag inisialisasi {@code plugins.FaceRecognition.enableInsecureFramePath} di
+     * capacitor.config (integrasi webview legacy yang sudah sadar risiko).
+     */
+    private boolean isInsecureFramePathAllowed() {
+        return DeviceIntegrity.isDebuggable(getContext())
+                || getConfig().getBoolean("enableInsecureFramePath", false);
+    }
+
     // ============================
     // Quality Gate (Fase 3.1)
     // ============================
@@ -1146,6 +1357,8 @@ public class FaceRecognitionPlugin extends Plugin {
     private static class AntiSpoofResult {
         String label;
         float liveScore, printScore, replayScore, spoofScore;
+        /** Sinyal artefak layar per frame (P2.2) — soft signal, lihat ScreenSuspect. */
+        float screenSuspectScore;
         boolean isLive;
         float[] probs27, probs40;
 
@@ -1155,6 +1368,7 @@ public class FaceRecognitionPlugin extends Plugin {
             o.put("liveScore", liveScore);
             o.put("printScore", printScore);
             o.put("replayScore", replayScore);
+            o.put("screenSuspectScore", screenSuspectScore);
             return o;
         }
 
@@ -1213,7 +1427,27 @@ public class FaceRecognitionPlugin extends Plugin {
                 && result.spoofScore < config.spoofVeto;
         result.probs27 = probs27;
         result.probs40 = probs40;
+        // Sinyal artefak layar per frame (P2.2) — soft signal untuk audit/tuning
+        result.screenSuspectScore = analyzeScreenSuspect(bitmap, bounds);
         return result;
+    }
+
+    /** Downsample crop wajah ke 32x32 lalu analisis artefak layar (P2.2). */
+    private float analyzeScreenSuspect(Bitmap bitmap, Rect bounds) {
+        try {
+            int x = Math.max(0, bounds.left);
+            int y = Math.max(0, bounds.top);
+            int w = Math.min(bitmap.getWidth() - x, bounds.width());
+            int h = Math.min(bitmap.getHeight() - y, bounds.height());
+            if (w <= 0 || h <= 0) return 0f;
+            Bitmap crop = Bitmap.createBitmap(bitmap, x, y, w, h);
+            Bitmap small = Bitmap.createScaledBitmap(crop, 32, 32, true);
+            int[] pixels = new int[32 * 32];
+            small.getPixels(pixels, 0, 32, 0, 0, 32, 32);
+            return ScreenSuspect.analyze(pixels, 32, 32).score;
+        } catch (Exception e) {
+            return 0f;
+        }
     }
 
     /**
@@ -1572,7 +1806,21 @@ public class FaceRecognitionPlugin extends Plugin {
         float exposureMin = EXPOSURE_MIN;
         float exposureMax = EXPOSURE_MAX;
         float identityThreshold = IDENTITY_CONSISTENCY;
-        int yawSign = 1;
+        /**
+         * Override tanda yaw per-perangkat (1 atau -1) untuk kasus buffer kamera
+         * ter-flip (mis. beberapa Samsung/OnePlus). Default 1 — konvensi normal
+         * sudah ditangani YawConvention di sumber pengukuran.
+         */
+        int yawSignOverride = 1;
+        /**
+         * Rasio minimum frame yang harus isLive per sesi (P2.1). Default 1.0 =
+         * SEMUA frame harus isLive (paling ketat). Jika pengukuran BPCER di
+         * example-app menunjukkan user asli sering gagal, turunkan (mis. 0.8) —
+         * veto per-frame SPOOF_FRAME_DETECTED tetap melindungi anti-replay.
+         */
+        float minLiveVoteRatio = 1.0f;
+        /** Veto screen-suspect per sesi (P2.2) — null = soft signal saja (default). */
+        Float screenSuspectVeto = null;
         boolean debug = false;
 
         static GateConfig from(JSObject config) {
@@ -1598,7 +1846,11 @@ public class FaceRecognitionPlugin extends Plugin {
             c.exposureMin    = (float) config.optDouble("exposureMin",    c.exposureMin);
             c.exposureMax    = (float) config.optDouble("exposureMax",    c.exposureMax);
             c.identityThreshold = (float) config.optDouble("identityThreshold", c.identityThreshold);
-            c.yawSign        = config.optInt("yawSign", 1);
+            c.yawSignOverride = config.optInt("yawSignOverride", 1);
+            c.minLiveVoteRatio = (float) config.optDouble("minLiveVoteRatio", 1.0);
+            if (config.has("screenSuspectVeto")) {
+                c.screenSuspectVeto = (float) config.optDouble("screenSuspectVeto");
+            }
             c.debug          = config.optBoolean("debug", false) && debugAllowed;
             return c;
         }
@@ -1640,6 +1892,8 @@ public class FaceRecognitionPlugin extends Plugin {
         int index;
         Rect bounds;
         float yaw, pitch, roll;
+        /** Epoch ms saat frame di-capture (native capture); -1 untuk jalur JS base64. */
+        double timestampMs = -1;
         QualityResult quality;
         AntiSpoofResult liveness;
         float[] embedding;

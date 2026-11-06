@@ -48,6 +48,7 @@ public class LivenessCaptureActivity extends Activity {
     public static final String EXTRA_INTERVAL_MS = "intervalMs";
     public static final String EXTRA_WARMUP_MS = "warmupMs";
     public static final String EXTRA_FRAME_PATHS = "framePaths";
+    public static final String EXTRA_FRAME_TIMESTAMPS = "frameTimestamps";
     public static final String EXTRA_ERROR = "error";
 
     private static final String FRAME_DIR = "liveness_frames";
@@ -64,6 +65,7 @@ public class LivenessCaptureActivity extends Activity {
     private long warmupMs;
     private int captured = 0;
     private final ArrayList<String> framePaths = new ArrayList<>();
+    private final ArrayList<Double> frameTimestamps = new ArrayList<>();
 
     public static Intent createIntent(Context context, String challenge, int frameCount,
                                       long intervalMs, long warmupMs) {
@@ -84,6 +86,13 @@ public class LivenessCaptureActivity extends Activity {
         intervalMs = getIntent().getLongExtra(EXTRA_INTERVAL_MS, 300L);
         warmupMs = getIntent().getLongExtra(EXTRA_WARMUP_MS, 1200L);
 
+        // FAIL-CLOSED: challenge tak dikenal tidak boleh diam-diam memakai
+        // instruksi default — sesi dibatalkan sebelum kamera dibuka.
+        if (!"LOOK_LEFT".equals(challenge) && !"LOOK_RIGHT".equals(challenge)) {
+            failWith("Challenge tidak dikenal");
+            return;
+        }
+
         buildUi();
         startCamera();
     }
@@ -97,9 +106,19 @@ public class LivenessCaptureActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         instructionView = new TextView(this);
-        String instruction = "LOOK_LEFT".equals(challenge)
-                ? "TOLEH KE KIRI perlahan, lalu kembali lurus"
-                : "TOLEH KE KANAN perlahan, lalu kembali lurus";
+        // FAIL-CLOSED: mapping eksplisit per challenge — nilai tak dikenal sudah
+        // ditolak di onCreate, TIDAK ada default diam-diam ke "ke kanan".
+        String instruction;
+        switch (challenge) {
+            case "LOOK_LEFT":
+                instruction = "TOLEH KE KIRI ANDA (dagu ke bahu kiri) perlahan, lalu kembali lurus";
+                break;
+            case "LOOK_RIGHT":
+                instruction = "TOLEH KE KANAN ANDA (dagu ke bahu kanan) perlahan, lalu kembali lurus";
+                break;
+            default:
+                instruction = ""; // tidak tercapai — onCreate sudah fail-closed
+        }
         instructionView.setText(instruction);
         instructionView.setTextColor(Color.WHITE);
         instructionView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
@@ -176,12 +195,18 @@ public class LivenessCaptureActivity extends Activity {
             @Override
             public void onImageSaved(@NonNull ImageCapture.OutputFileResults results) {
                 framePaths.add(outFile.getAbsolutePath());
+                frameTimestamps.add((double) System.currentTimeMillis());
                 captured++;
                 progressView.setText("Mengambil frame " + captured + "/" + frameCount);
 
                 if (captured >= frameCount) {
+                    double[] timestamps = new double[frameTimestamps.size()];
+                    for (int i = 0; i < timestamps.length; i++) {
+                        timestamps[i] = frameTimestamps.get(i);
+                    }
                     Intent data = new Intent();
                     data.putStringArrayListExtra(EXTRA_FRAME_PATHS, framePaths);
+                    data.putExtra(EXTRA_FRAME_TIMESTAMPS, timestamps);
                     data.putExtra(EXTRA_CHALLENGE, challenge);
                     setResult(RESULT_OK, data);
                     finish();

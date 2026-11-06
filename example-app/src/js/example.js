@@ -98,7 +98,7 @@ function collectConfig() {
     exposureMin: parseFloat($('exposureMin').value),
     exposureMax: parseFloat($('exposureMax').value),
     minFrameSide: parseInt($('minFrameSide').value, 10),
-    yawSign: parseInt($('yawSign').value, 10),
+    yawSignOverride: parseInt($('yawSignOverride').value, 10),
     debug: $('debug').value === 'true',
   };
 }
@@ -210,15 +210,101 @@ function stopYawStream() {
 }
 
 // ============================
+// Kalibrasi Yaw (P0-a) — verifikasi konvensi arah di perangkat ini
+// ============================
+// Kontrak liveness-v3: yaw ternormalisasi NEGATIF = menoleh ke KIRI anatomis.
+async function captureYawStats(durationMs) {
+  const video = $('video');
+  if (!video.videoWidth) {
+    alert('Kamera belum aktif.');
+    return null;
+  }
+  let min = Infinity;
+  let max = -Infinity;
+  const start = Date.now();
+  while (Date.now() - start < durationMs) {
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    const frame = dataUrlToBase64(canvas.toDataURL('image/jpeg', 0.7));
+    try {
+      const result = await FaceRecognition.detectFaces({ imageBase64: frame });
+      const f = result.faces && result.faces[0];
+      if (f) {
+        min = Math.min(min, f.headEulerAngleY);
+        max = Math.max(max, f.headEulerAngleY);
+        $('yawValue').textContent = f.headEulerAngleY.toFixed(1);
+      }
+    } catch (e) {
+      // frame terlewat — lanjut
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return { min, max };
+}
+
+async function runYawCalibration() {
+  const out = $('yawCalibResult');
+  try {
+    out.innerHTML = badge('1/2 — Dagu ke bahu KIRI ANDA, tahan...', 'warn');
+    const left = await captureYawStats(3000);
+    out.innerHTML = badge('2/2 — Dagu ke bahu KANAN ANDA, tahan...', 'warn');
+    const right = await captureYawStats(3000);
+    if (!left || !right) return;
+
+    const leftOk = left.min <= -10;
+    const rightOk = right.max >= 10;
+    const inverted = left.max >= 10 && right.min <= -10;
+    const detail = `kiri: min ${left.min.toFixed(1)} / max ${left.max.toFixed(1)} · ` +
+      `kanan: min ${right.min.toFixed(1)} / max ${right.max.toFixed(1)}`;
+
+    if (leftOk && rightOk) {
+      $('yawSignOverride').value = '1';
+      out.innerHTML = `${badge('KONVENSI YAW OK', 'ok')} menoleh kiri → yaw negatif ✓ · ` +
+        `menoleh kanan → yaw positif ✓ · ${detail}`;
+    } else if (inverted) {
+      $('yawSignOverride').value = '-1';
+      out.innerHTML = `${badge('TERBALIK — yawSignOverride = -1 di-set otomatis', 'fail')} ` +
+        `arah di perangkat ini terbalik (buffer ter-flip?). ${detail} — ` +
+        `laporkan agar konstanta platform diperbaiki.`;
+    } else {
+      out.innerHTML = `${badge('TIDAK JELAS — ulangi', 'warn')} pastikan menoleh cukup jauh ` +
+        `(±20°), wajah terdeteksi, lalu jalankan lagi. ${detail}`;
+    }
+  } catch (e) {
+    out.innerHTML = `${badge('ERROR', 'fail')} ${String(e)}`;
+  }
+}
+
+// ============================
 // Sesi Multi-frame (challenge)
 // ============================
+// Ringkasan lintasan challenge (P1) + sinyal anti-replay (P2).
+function trajectoryHtml(result) {
+  const tr = result.trajectory;
+  if (!tr) return '';
+  const rules = tr.rulesPassed || {};
+  const marks = [
+    ['R1', rules.frontalStart], ['R2', rules.deviation], ['R3', rules.returnFrontal],
+    ['R4', rules.singleDirection], ['R5', rules.smoothMotion],
+  ].map(([k, ok]) => `${k}=${ok ? '✓' : '✗'}`).join(' ');
+  const flags = [
+    tr.tooSmooth ? 'TOO-SMOOTH ⚠' : '',
+    `screenSuspect=${Number(result.screenSuspect ?? 0).toFixed(2)}`,
+  ].filter(Boolean).join(' · ');
+  return `lintasan: ${marks} · extreme=${Number(tr.extremeYaw).toFixed(1)}@frame${tr.extremeFrame}
+      · wrongWay=${Number(tr.wrongWayMax).toFixed(1)} · deltaVar=${Number(tr.deltaVariance).toFixed(2)}
+      · dur=${Math.round(tr.durationMs)}ms · ${flags}`;
+}
+
 async function runSession() {
   try {
-    // 1. Dapatkan challenge acak
-    const { challenge } = await FaceRecognition.getLivenessChallenge();
+    // 1. Buat challenge session (acak, single-use — arah tidak bisa dipilih dari JS)
+    const { challengeId, challenge } = await FaceRecognition.createChallengeSession();
     const instruction = challenge === 'LOOK_LEFT'
-      ? 'TOLEH KE KIRI perlahan, lalu kembali lurus.'
-      : 'TOLEH KE KANAN perlahan, lalu kembali lurus.';
+      ? 'TOLEH KE KIRI ANDA (dagu ke bahu kiri) perlahan, lalu kembali lurus.'
+      : 'TOLEH KE KANAN ANDA (dagu ke bahu kanan) perlahan, lalu kembali lurus.';
     $('challengeHint').innerHTML = `<b>Challenge: ${challenge}</b> — ${instruction} Mengambil 5 frame...`;
     setSessionResult(badge(`Challenge: ${challenge}`, 'warn'), null);
 
@@ -241,7 +327,7 @@ async function runSession() {
     // 3. Verifikasi sesi
     const result = await FaceRecognition.verifyFaceSequence({
       images: frames,
-      challenge,
+      challengeId,
       config: collectConfig(),
     });
     const html = `
@@ -250,7 +336,8 @@ async function runSession() {
       liveVotes=${result.liveVotes}/${result.frameCount}
       yaw=[${result.minYaw.toFixed(1)}..${result.maxYaw.toFixed(1)}]
       frontalFrames=${result.frontalFrames}
-      identityConsistent=${result.identityConsistent}`;
+      identityConsistent=${result.identityConsistent}
+      ${trajectoryHtml(result)}`;
     setSessionResult(html, result);
     lastTest = { method: 'verifyFaceSequence', isLive: result.passed, result };
     $('challengeHint').textContent =
@@ -274,6 +361,7 @@ async function runNativeSession() {
       liveVotes=${result.liveVotes}/${result.frameCount}
       <br/>deviceIntegrity: emulator=${integrity.isEmulator} rooted=${integrity.isRooted}
       debuggable=${integrity.isDebuggable} hooks=${integrity.hooksDetected}
+      <br/>${trajectoryHtml(result)}
       <br/>auditId=${result.auditId ?? '-'}`;
     setSessionResult(html, result);
     lastTest = { method: 'captureLivenessSession', isLive: result.passed, result };
@@ -370,6 +458,7 @@ $('fileInput').addEventListener('change', (e) => {
   if (e.target.files && e.target.files[0]) loadFile(e.target.files[0]);
 });
 $('btnYawStream').addEventListener('click', toggleYawStream);
+$('btnYawCalib').addEventListener('click', runYawCalibration);
 $('btnCheckLiveness').addEventListener('click', runCheckLiveness);
 $('btnVerifyFace').addEventListener('click', runVerifyFace);
 $('btnDetectFaces').addEventListener('click', runDetectFaces);

@@ -90,7 +90,7 @@ The plugin includes both TFLite models directly in the package — **no manual d
 * [`checkLiveness(...)`](#checkliveness)
 * [`detectFaces(...)`](#detectfaces)
 * [`verifyFace(...)`](#verifyface)
-* [`getLivenessChallenge()`](#getlivenesschallenge)
+* [`createChallengeSession()`](#createchallengesession)
 * [`verifyFaceSequence(...)`](#verifyfacesequence)
 * [`captureLivenessSession(...)`](#capturelivenesssession)
 * [`getDeviceIntegrity()`](#getdeviceintegrity)
@@ -176,6 +176,8 @@ Useful for early validation and active challenge in JS layer.
 iOS: uses VNDetectFaceLandmarksRequest for eye landmarks (EAR-based).
 Android: uses ML Kit with CLASSIFICATION_MODE_ALL.
 Angles are in DEGREES on both platforms (iOS converts from radians).
+headEulerAngleY (yaw) is NORMALIZED: positive = user's anatomical right,
+negative = user's anatomical left (same convention as the challenge).
 
 | Param         | Type                                  |
 | ------------- | ------------------------------------- |
@@ -205,16 +207,18 @@ returned when isLive is true.
 --------------------
 
 
-### getLivenessChallenge()
+### createChallengeSession()
 
 ```typescript
-getLivenessChallenge() => Promise<{ challenge: ChallengeType; }>
+createChallengeSession() => Promise<{ challengeId: string; challenge: ChallengeType; expiresAt: number; }>
 ```
 
-Issues a random active challenge for a liveness session.
-Show the instruction to the user, capture frames, then call verifyFaceSequence.
+Creates a native challenge session (random direction, single-use, 60s expiry).
+Show the instruction to the user, capture frames, then call verifyFaceSequence
+with the returned challengeId. The challenge direction CANNOT be chosen
+from JS — it is always generated natively.
 
-**Returns:** <code>Promise&lt;{ challenge: <a href="#challengetype">ChallengeType</a>; }&gt;</code>
+**Returns:** <code>Promise&lt;{ challengeId: string; challenge: <a href="#challengetype">ChallengeType</a>; expiresAt: number; }&gt;</code>
 
 --------------------
 
@@ -222,25 +226,46 @@ Show the instruction to the user, capture frames, then call verifyFaceSequence.
 ### verifyFaceSequence(...)
 
 ```typescript
-verifyFaceSequence(options: { images: string[]; challenge: ChallengeType; referenceEmbedding?: number[]; config?: LivenessConfig; }) => Promise<VerifyFaceSequenceResult>
+verifyFaceSequence(options: { images: string[]; challengeId: string; referenceEmbedding?: number[]; config?: LivenessConfig; }) => Promise<VerifyFaceSequenceResult>
 ```
 
 Multi-frame verification with active challenge (helper in plugin).
 
+DEV/QA-ONLY-BY-DEFAULT: this path accepts base64 frames from JS (a
+frame-injection surface) and is therefore only available on DEBUG builds,
+OR when the host app explicitly opts in via the Capacitor config flag
+`plugins.FaceRecognition.enableInsecureFramePath: true` (legacy webview
+integrations that accept the risk). Production should prefer
+captureLivenessSession. The result always carries `native: false`.
+
 Pass &gt;= 5 frames captured over ~1.5 seconds. Passing rules:
 - every frame must pass the quality gate
-- median liveScore &gt;= liveThreshold AND majority of frames isLive (voting,
-  NOT "all frames must live")
+- anti-replay (P2): NO frame may be a hard spoof (label PRINT/REPLAY or
+  spoofScore &gt;= 0.5 → SPOOF_FRAME_DETECTED), the session duration must look
+  human (TIMING_SUSPECT), and screenSuspectVeto, when configured, must not
+  be reached (SCREEN_SUSPECTED)
+- live voting: `minLiveVoteRatio` of frames must be isLive (default 1.0 =
+  ALL frames) AND median liveScore &gt;= liveThreshold
 - identity consistent among pose-comparable frames (|yaw| &lt;= 12 deg):
   cosine &gt;= identityThreshold (default 0.7) vs the MOST FRONTAL frame.
   Frames with |yaw| &gt; 12 deg serve the challenge only and are excluded —
   their embeddings are not pose-invariant.
-- challenge satisfied: yaw deviates &gt;= 15 deg in the requested direction,
-  then &gt;= 2 frames return near frontal (|yaw| &lt; 15 deg)
+- challenge satisfied — verified as a TEMPORAL TRAJECTORY (not min/max):
+  R1 start near frontal (|yaw| &lt; 8 deg) → R2 deviation &gt;= 15 deg toward the
+  requested direction (yaw is normalized: positive = user's anatomical
+  right; LOOK_LEFT needs a NEGATIVE deviation) → R3 return near frontal
+  (|yaw| &lt; 12 deg), with R4 no sustained movement toward the wrong
+  direction (&lt; 12 deg — rejects head-shakes) and R5 sustained smooth
+  motion (&gt;= 3 same-direction deltas, median-3 filtered).
+  Failure reasons: CHALLENGE_WRONG_DIRECTION (R4), CHALLENGE_NO_RETURN (R3),
+  CHALLENGE_FAILED (R1/R2/R5).
 
-| Param         | Type                                                                                                                                                                            |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`options`** | <code>{ images: string[]; challenge: <a href="#challengetype">ChallengeType</a>; referenceEmbedding?: number[]; config?: <a href="#livenessconfig">LivenessConfig</a>; }</code> |
+The challenge direction is read from the native challenge session
+(single-use) — never from JS input.
+
+| Param         | Type                                                                                                                                          |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`options`** | <code>{ images: string[]; challengeId: string; referenceEmbedding?: number[]; config?: <a href="#livenessconfig">LivenessConfig</a>; }</code> |
 
 **Returns:** <code>Promise&lt;<a href="#verifyfacesequenceresult">VerifyFaceSequenceResult</a>&gt;</code>
 
@@ -250,7 +275,7 @@ Pass &gt;= 5 frames captured over ~1.5 seconds. Passing rules:
 ### captureLivenessSession(...)
 
 ```typescript
-captureLivenessSession(options: { challenge?: ChallengeType; referenceEmbedding?: number[]; config?: LivenessConfig; }) => Promise<NativeSessionResult>
+captureLivenessSession(options: { referenceEmbedding?: number[]; config?: LivenessConfig; }) => Promise<NativeSessionResult>
 ```
 
 Native liveness session (anti frame-injection, Fase 4).
@@ -263,11 +288,14 @@ Only the RESULT is returned — never the raw frames.
 The session is rate-limited (max 10 attempts per 5 minutes) and logged to
 an encrypted local audit store for HRIS fraud review.
 
+The challenge direction is ALWAYS generated natively at random — it cannot
+be chosen by the caller.
+
 Requires camera permission (requested automatically).
 
-| Param         | Type                                                                                                                                                           |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`options`** | <code>{ challenge?: <a href="#challengetype">ChallengeType</a>; referenceEmbedding?: number[]; config?: <a href="#livenessconfig">LivenessConfig</a>; }</code> |
+| Param         | Type                                                                                                   |
+| ------------- | ------------------------------------------------------------------------------------------------------ |
+| **`options`** | <code>{ referenceEmbedding?: number[]; config?: <a href="#livenessconfig">LivenessConfig</a>; }</code> |
 
 **Returns:** <code>Promise&lt;<a href="#nativesessionresult">NativeSessionResult</a>&gt;</code>
 
@@ -307,12 +335,13 @@ audit logging, not as a single gate.
 
 #### LivenessResult
 
-| Prop              | Type                                                    | Description                      |
-| ----------------- | ------------------------------------------------------- | -------------------------------- |
-| **`label`**       | <code><a href="#livenesslabel">LivenessLabel</a></code> |                                  |
-| **`liveScore`**   | <code>number</code>                                     | Probabilitas live (0..1)         |
-| **`printScore`**  | <code>number</code>                                     | Probabilitas print spoof (0..1)  |
-| **`replayScore`** | <code>number</code>                                     | Probabilitas replay spoof (0..1) |
+| Prop                     | Type                                                    | Description                                                              |
+| ------------------------ | ------------------------------------------------------- | ------------------------------------------------------------------------ |
+| **`label`**              | <code><a href="#livenesslabel">LivenessLabel</a></code> |                                                                          |
+| **`liveScore`**          | <code>number</code>                                     | Probabilitas live (0..1)                                                 |
+| **`printScore`**         | <code>number</code>                                     | Probabilitas print spoof (0..1)                                          |
+| **`replayScore`**        | <code>number</code>                                     | Probabilitas replay spoof (0..1)                                         |
+| **`screenSuspectScore`** | <code>number</code>                                     | Sinyal artefak layar per frame (P2.2) — soft signal eksperimental (0..1) |
 
 
 #### QualityResult
@@ -339,20 +368,22 @@ audit logging, not as a single gate.
 
 Konfigurasi liveness & quality gate — semua opsional (default lihat README).
 
-| Prop                    | Type                 | Description                                                                                                                                                                                                       |
-| ----------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`liveThreshold`**     | <code>number</code>  | Threshold liveScore minimum. Default 0.80                                                                                                                                                                         |
-| **`spoofVeto`**         | <code>number</code>  | Veto: maksimum skor spoof yang ditoleransi. Default 0.20                                                                                                                                                          |
-| **`minFrameSide`**      | <code>number</code>  | Sisi terpendek frame minimum (px). Default 480                                                                                                                                                                    |
-| **`minFaceRatio`**      | <code>number</code>  | faceWidth / frameWidth minimum. Default 0.25                                                                                                                                                                      |
-| **`edgeMargin`**        | <code>number</code>  | Margin tepi frame (0..1). Default 0.05                                                                                                                                                                            |
-| **`maxPose`**           | <code>number</code>  | Maksimum \|yaw\|/\|pitch\|/\|roll\| (derajat). Default 20                                                                                                                                                         |
-| **`blurMin`**           | <code>number</code>  | Variance of Laplacian minimum (perlu kalibrasi). Default 50                                                                                                                                                       |
-| **`exposureMin`**       | <code>number</code>  | Mean luminance minimum. Default 60                                                                                                                                                                                |
-| **`exposureMax`**       | <code>number</code>  | Mean luminance maksimum. Default 200                                                                                                                                                                              |
-| **`identityThreshold`** | <code>number</code>  | Threshold cosine konsistensi identitas antar frame sebanding. Default 0.7                                                                                                                                         |
-| **`yawSign`**           | <code>number</code>  | Konvensi tanda yaw untuk challenge (1 atau -1). Default 1. Diterapkan ke nilai yaw SEBELUM agregasi min/max. -1 membalik arah challenge (mis. untuk frame ter-mirror, atau konvensi tanda platform yang berbeda). |
-| **`debug`**             | <code>boolean</code> | Kembalikan data debug (probs per model). Default false                                                                                                                                                            |
+| Prop                    | Type                 | Description                                                                                                                                                                                                                                                                                      |
+| ----------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`liveThreshold`**     | <code>number</code>  | Threshold liveScore minimum. Default 0.80                                                                                                                                                                                                                                                        |
+| **`spoofVeto`**         | <code>number</code>  | Veto: maksimum skor spoof yang ditoleransi. Default 0.20                                                                                                                                                                                                                                         |
+| **`minFrameSide`**      | <code>number</code>  | Sisi terpendek frame minimum (px). Default 480                                                                                                                                                                                                                                                   |
+| **`minFaceRatio`**      | <code>number</code>  | faceWidth / frameWidth minimum. Default 0.25                                                                                                                                                                                                                                                     |
+| **`edgeMargin`**        | <code>number</code>  | Margin tepi frame (0..1). Default 0.05                                                                                                                                                                                                                                                           |
+| **`maxPose`**           | <code>number</code>  | Maksimum \|yaw\|/\|pitch\|/\|roll\| (derajat). Default 20                                                                                                                                                                                                                                        |
+| **`blurMin`**           | <code>number</code>  | Variance of Laplacian minimum (perlu kalibrasi). Default 50                                                                                                                                                                                                                                      |
+| **`exposureMin`**       | <code>number</code>  | Mean luminance minimum. Default 60                                                                                                                                                                                                                                                               |
+| **`exposureMax`**       | <code>number</code>  | Mean luminance maksimum. Default 200                                                                                                                                                                                                                                                             |
+| **`identityThreshold`** | <code>number</code>  | Threshold cosine konsistensi identitas antar frame sebanding. Default 0.7                                                                                                                                                                                                                        |
+| **`yawSignOverride`**   | <code>number</code>  | Override tanda yaw per-perangkat (1 atau -1) untuk kasus buffer kamera ter-flip (mis. beberapa Samsung/OnePlus). Default 1. Konvensi arah normal sudah dinormalisasi plugin (yaw positif = menoleh ke kanan anatomis user) — jangan isi kecuali halaman "Kalibrasi Yaw" example-app menyuruhnya. |
+| **`minLiveVoteRatio`**  | <code>number</code>  | Rasio minimum frame yang harus isLive per sesi (P2.1). Default 1.0 = SEMUA frame harus isLive. Turunkan (mis. 0.8) jika pengukuran BPCER menunjukkan user asli sering gagal — veto per-frame SPOOF_FRAME_DETECTED tetap aktif.                                                                   |
+| **`screenSuspectVeto`** | <code>number</code>  | Veto screen-suspect per sesi (P2.2), 0..1. Default tidak di-set = soft signal saja (skor tetap dilaporkan di hasil & audit). Set eksplisit untuk mode ketat: sesi gagal (SCREEN_SUSPECTED) jika skor &gt;= veto.                                                                                 |
+| **`debug`**             | <code>boolean</code> | Kembalikan data debug (probs per model). Default false                                                                                                                                                                                                                                           |
 
 
 #### VerifyFaceSequenceResult
@@ -362,16 +393,51 @@ Konfigurasi liveness & quality gate — semua opsional (default lihat README).
 | **`passed`**             | <code>boolean</code>                                                    |                                                                                                                                                       |
 | **`reason`**             | <code><a href="#sequencefailurereason">SequenceFailureReason</a></code> |                                                                                                                                                       |
 | **`challenge`**          | <code><a href="#challengetype">ChallengeType</a></code>                 |                                                                                                                                                       |
+| **`challengeId`**        | <code>string</code>                                                     | Present on verifyFaceSequence results (from createChallengeSession).                                                                                  |
+| **`native`**             | <code>boolean</code>                                                    | false = jalur JS base64 (dev-only), true = native capture (produksi)                                                                                  |
 | **`medianLiveScore`**    | <code>number</code>                                                     |                                                                                                                                                       |
 | **`liveVotes`**          | <code>number</code>                                                     |                                                                                                                                                       |
 | **`frameCount`**         | <code>number</code>                                                     |                                                                                                                                                       |
-| **`maxYaw`**             | <code>number</code>                                                     |                                                                                                                                                       |
-| **`minYaw`**             | <code>number</code>                                                     |                                                                                                                                                       |
+| **`maxYaw`**             | <code>number</code>                                                     | Max normalized yaw across quality-passed frames (positive = user's anatomical right)                                                                  |
+| **`minYaw`**             | <code>number</code>                                                     | Min normalized yaw across quality-passed frames (negative = user's anatomical left)                                                                   |
 | **`frontalFrames`**      | <code>number</code>                                                     |                                                                                                                                                       |
 | **`identityConsistent`** | <code>boolean</code>                                                    |                                                                                                                                                       |
 | **`minIdentityCosine`**  | <code>number \| null</code>                                             | Cosine minimum antara frame sebanding terhadap frame referensi (paling frontal). null jika kurang dari 2 frame sebanding. Untuk diagnostik kalibrasi. |
+| **`trajectory`**         | <code><a href="#trajectorysummary">TrajectorySummary</a></code>         | Ringkasan lintasan challenge (aturan R1–R5 + statistik yaw)                                                                                           |
+| **`screenSuspect`**      | <code>number</code>                                                     | Sinyal artefak layar agregat (P2.2) — max antar frame; soft signal kecuali screenSuspectVeto di-set (mode ketat → SCREEN_SUSPECTED).                  |
+| **`yawTrace`**           | <code>{ index: number; yaw: number; timestampMs?: number; }[]</code>    | Trace yaw per frame — HANYA jika config.debug (build debug)                                                                                           |
 | **`thresholdVersion`**   | <code>string</code>                                                     |                                                                                                                                                       |
 | **`match`**              | <code><a href="#matchresult">MatchResult</a></code>                     |                                                                                                                                                       |
+
+
+#### TrajectorySummary
+
+Ringkasan lintasan challenge (P1) — selalu ada di hasil sesi.
+
+| Prop                | Type                                                                    | Description                                                                                     |
+| ------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| **`startYaw`**      | <code>number</code>                                                     |                                                                                                 |
+| **`endYaw`**        | <code>number</code>                                                     |                                                                                                 |
+| **`extremeYaw`**    | <code>number</code>                                                     | Deviasi ekstrem ke arah challenge                                                               |
+| **`extremeFrame`**  | <code>number</code>                                                     |                                                                                                 |
+| **`wrongWayMax`**   | <code>number</code>                                                     | Deviasi teramati ke arah SALAH (diagnostik)                                                     |
+| **`deltaVariance`** | <code>number</code>                                                     | Varians magnitudo delta yaw — mendekati 0 menandai gerakan konstan sempurna (dugaan video-loop) |
+| **`tooSmooth`**     | <code>boolean</code>                                                    | Lintasan "terlalu sempurna" (deltaVariance ≈ 0) — soft signal dugaan video-loop (P2.3)          |
+| **`durationMs`**    | <code>number</code>                                                     | Durasi sesi dalam ms (0 jika timestamp tidak tersedia)                                          |
+| **`rulesPassed`**   | <code><a href="#trajectoryrulespassed">TrajectoryRulesPassed</a></code> |                                                                                                 |
+
+
+#### TrajectoryRulesPassed
+
+Hasil per-aturan lintasan challenge (P1) — lihat ChallengeTrajectory.
+
+| Prop                  | Type                 | Description                                                                            |
+| --------------------- | -------------------- | -------------------------------------------------------------------------------------- |
+| **`frontalStart`**    | <code>boolean</code> | R1 — frame awal mendekati frontal (\|yaw\| &lt; 8°)                                    |
+| **`deviation`**       | <code>boolean</code> | R2 — ada deviasi ≥ 15° ke arah challenge, setelah fase awal                            |
+| **`returnFrontal`**   | <code>boolean</code> | R3 — frame akhir kembali mendekati frontal (\|yaw\| &lt; 12°)                          |
+| **`singleDirection`** | <code>boolean</code> | R4 — tanpa gerakan berkelanjutan ke arah SALAH (deviasi &lt; 12°) — menolak head-shake |
+| **`smoothMotion`**    | <code>boolean</code> | R5 — gerakan halus berkelanjutan (≥ 3 delta searah pada nilai ter-filter median-3)     |
 
 
 #### NativeSessionResult
@@ -418,7 +484,7 @@ Keputusan akhir tetap di aplikasi/server; jangan jadikan gerbang tunggal.
 
 #### SequenceFailureReason
 
-<code>'QUALITY_FAILED' | 'IDENTITY_INCONSISTENT' | 'CHALLENGE_FAILED' | 'NOT_LIVE_ENOUGH'</code>
+<code>'QUALITY_FAILED' | 'IDENTITY_INCONSISTENT' | 'CHALLENGE_FAILED' | 'CHALLENGE_WRONG_DIRECTION' | 'CHALLENGE_NO_RETURN' | 'SPOOF_FRAME_DETECTED' | 'SCREEN_SUSPECTED' | 'TIMING_SUSPECT' | 'NOT_LIVE_ENOUGH'</code>
 
 </docgen-api>
 
@@ -470,10 +536,11 @@ dengan active challenge.
 ```typescript
 async function enrollFace(images: string[]): Promise<number[]> {
   // images: ≥ 5 frame yang diambil dalam ~1.5 detik
-  const { challenge } = await FaceRecognition.getLivenessChallenge();
-  // tampilkan instruksi challenge ke user, lalu tangkap frame-frame sesi
+  const { challengeId, challenge } = await FaceRecognition.createChallengeSession();
+  // tampilkan instruksi challenge ke user (arah TIDAK bisa dipilih dari JS),
+  // lalu tangkap frame-frame sesi sebelum challengeId kedaluwarsa (60 detik)
 
-  const session = await FaceRecognition.verifyFaceSequence({ images, challenge });
+  const session = await FaceRecognition.verifyFaceSequence({ images, challengeId });
   if (!session.passed) throw new Error(`Enrollment liveness gagal: ${session.reason}`);
 
   // Ambil embedding dari frame pertama yang lolos (verifyFace untuk frame yang sama)
@@ -578,15 +645,18 @@ file penuh. Untuk pemeriksaan fraud HRIS. Hak hapus (UU PDP): hapus folder
 Halaman uji & kalibrasi tersedia di `example-app/` (`npm start` di folder itu).
 Fasilitasnya:
 
-1. **Verifikasi tanda yaw** — stream angle live (yaw/pitch/roll). Saat menoleh kiri,
-   pastikan yaw bernilai **negatif**. Jika positif, set `yawSign: -1` di konfigurasi.
-   Ini wajib diverifikasi per perangkat sebelum memakai active challenge.
+1. **Kalibrasi Yaw (P0-a)** — tombol "Mulai Kalibrasi Yaw": ikuti instruksi
+   (dagu ke bahu kiri, lalu kanan). Konvensi liveness-v3: **yaw negatif = menoleh
+   ke kiri anatomis Anda**. Jika hasil TERBALIK (buffer kamera ter-flip, mis.
+   beberapa Samsung/OnePlus), tool otomatis set `yawSignOverride: -1` di konfigurasi —
+   laporkan temuan itu agar konstanta platform diperbaiki. Wajib diverifikasi per
+   perangkat sebelum memakai active challenge.
 2. **Kalibrasi threshold** — slider `liveThreshold`, `spoofVeto`, `blurMin`, dll.
    langsung dikirim ke `verifyFace` sebagai `LivenessConfig` (tanpa rebuild).
 3. **Uji single frame** — `checkLiveness`, `verifyFace`, `detectFaces` pada frame
    kamera atau file gambar. Untuk regression test: muat screenshot yang dulu lolos,
    pastikan kini **ditolak** dengan label PRINT/REPLAY.
-4. **Sesi multi-frame** — `getLivenessChallenge` + `verifyFaceSequence` otomatis
+4. **Sesi multi-frame** — `createChallengeSession` + `verifyFaceSequence` otomatis
    (5 frame, ~1,5 detik).
 5. **Dataset logger** — labeli hasil uji sebagai LIVE / REPLAY / PRINT, lalu ekspor
    JSON/CSV. Estimasi APCER/BPCER ditampilkan dari log (angka sementara — untuk
@@ -685,7 +755,8 @@ Already registered in `Package.swift` — no additional configuration required.
 
 ## Acknowledgements
 
-- **Anti-Spoofing Model**: The liveness detection utilizes the MiniFASNet model originating from [minivision-ai/Silent-Face-Anti-Spoofing](https://github.com/minivision-ai/Silent-Face-Anti-Spoofing), which is licensed under the Apache License 2.0.
+- **Anti-Spoofing Model**: The liveness detection utilizes the MiniFASNet model originating from [minivision-ai/Silent-Face-Anti-Spoofing](https://github.com/minivision-ai/Silent-Face-Anti-Spoofing), which is licensed under the Apache License 2.0. The TFLite conversion is from [shubham0204/OnDevice-Face-Recognition-Android](https://github.com/shubham0204/OnDevice-Face-Recognition-Android).
+- **Face Recognition Model**: The face embedding uses the MobileFaceNet architecture (192-dim, input 112×112) built with [sirius-ai/MobileFaceNet_TF](https://github.com/sirius-ai/MobileFaceNet_TF) (Apache License 2.0) — verified via graph-op fingerprint matching against that repository's pretrained model; the bundled weights are a 192-dim checkpoint variant of the same codebase. Full provenance record and SHA-256 checksums: [`doc/MODEL_SOURCES.md`](doc/MODEL_SOURCES.md).
 
 ---
 

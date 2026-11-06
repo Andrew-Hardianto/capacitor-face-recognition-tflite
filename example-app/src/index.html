@@ -124,18 +124,22 @@
 
     <!-- B. Yaw Sign Tester -->
     <section>
-      <h2>2. Verifikasi Tanda Yaw (kalibrasi Fase 5)</h2>
+      <h2>2. Kalibrasi Yaw (verifikasi konvensi arah — P0-a)</h2>
       <p class="hint">
-        Mulai stream, lalu toleh kepala ke KIRI dan amati tanda <b>yaw</b>.
-        Jika yaw bernilai <b>negatif</b> saat menoleh kiri → konvensi default sudah benar (yawSign = 1).
-        Jika positif → set yawSign = -1.
+        Yaw kini <b>ternormalisasi</b>: <b>negatif = menoleh ke KIRI anatomis Anda</b>,
+        positif = ke kanan. Jalankan kalibrasi untuk memverifikasinya di perangkat ini:
+        ikuti instruksi (kiri dulu, lalu kanan). Jika hasil <b>TERBALIK</b>, tool akan
+        otomatis set <code>yawSignOverride = -1</code> di konfigurasi di bawah
+        (buffer kamera ter-flip — laporkan agar konstanta platform diperbaiki).
       </p>
       <div class="row">
+        <button id="btnYawCalib">Mulai Kalibrasi Yaw</button>
         <button id="btnYawStream" class="secondary">Mulai Stream Angles</button>
       </div>
       <div class="stat">
         yaw: <b id="yawValue">-</b> &nbsp; pitch: <b id="pitchValue">-</b> &nbsp; roll: <b id="rollValue">-</b>
       </div>
+      <div class="stat" id="yawCalibResult"></div>
     </section>
 
     <!-- C. Kalibrasi -->
@@ -162,8 +166,8 @@
       <div class="row">
         <label class="field" style="flex:1"><span>minFrameSide (px)</span>
           <input type="number" id="minFrameSide" value="480" /></label>
-        <label class="field" style="flex:1"><span>yawSign (1 / -1)</span>
-          <select id="yawSign"><option value="1">1 (default)</option><option value="-1">-1</option></select></label>
+        <label class="field" style="flex:1"><span>yawSignOverride (1 / -1)</span>
+          <select id="yawSignOverride"><option value="1">1 (default)</option><option value="-1">-1 (buffer ter-flip)</option></select></label>
         <label class="field" style="flex:1"><span>debug output</span>
           <select id="debug"><option value="true">aktif</option><option value="false">mati</option></select></label>
       </div>

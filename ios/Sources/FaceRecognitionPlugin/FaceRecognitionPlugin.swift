@@ -18,7 +18,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "checkLiveness", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "detectFaces", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "verifyFace", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "getLivenessChallenge", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "createChallengeSession", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "verifyFaceSequence", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "captureLivenessSession", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getDeviceIntegrity", returnType: CAPPluginReturnPromise),
@@ -68,7 +68,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     private let liveThreshold: Float = 0.80
     private let spoofVeto: Float = 0.20
     // Versi threshold — disertakan di setiap hasil agar perubahan semantik terlacak
-    private let thresholdVersion = "liveness-v2"
+    private let thresholdVersion = "liveness-v3"
     private let matchThresholdVersion = "match-v1"
 
     // ============================
@@ -84,9 +84,14 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     // Konsistensi identitas antar frame (verifyFaceSequence)
     private let identityMaxPose: Float = 12
     // Active challenge
-    private let challengeYawMin: Float = 15
-    private let challengeFrontMax: Float = 15
-    private let challengeMinFrontalFrames = 2
+    // CATATAN KONVENSI (liveness-v3): yaw sudah ternormalisasi di sumber
+    // pengukuran (YawConvention) — positif = user menoleh ke kanan anatomisnya.
+    // LOOK_LEFT butuh deviasi yaw NEGATIF; LOOK_RIGHT positif.
+    // Threshold aturan lintasan (R1–R5) ada di ChallengeTrajectory.Thresholds.
+    private let challengeFrontMax: Float = 15   // pelaporan field frontalFrames
+    // Challenge session (P0): challenge dikeluarkan native, single-use + expiry.
+    // JS tidak bisa memilih arah challenge — lihat createChallengeSession.
+    private let challengeTTL: TimeInterval = 60
 
     // ============================
     // Pertahanan berlapis (Fase 4)
@@ -95,6 +100,15 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     private let maxSessionAttempts = 10
     private let sessionAttemptWindow: TimeInterval = 5 * 60
     private var sessionAttempts: [Date] = []
+    // Anti-replay (P2): veto per-frame + timing sesi
+    // spoofHardVeto: satu frame dengan label spoof (PRINT/REPLAY) atau
+    //   spoofScore >= veto ini → sesi GAGAL (SPOOF_FRAME_DETECTED), tanpa toleransi voting.
+    private let spoofHardVeto: Float = 0.5
+    // Rentang durasi sesi yang wajar untuk gerakan manusia (12 frame @ ~120ms).
+    // Ambang atas 5s (bukan 3s seperti plan) untuk toleransi latensi capture
+    // perangkat lambat — capture berantai mengukur interval SETELAH frame selesai.
+    private let sessionDurationMinMs: Double = 1000
+    private let sessionDurationMaxMs: Double = 5000
 
     /// Output debug hanya diizinkan pada build DEBUG (Fase 4).
     private var debugAllowed: Bool {
@@ -105,12 +119,72 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         #endif
     }
 
+    /// P2.4: jalur frame base64 dari JS (verifyFaceSequence) adalah celah injeksi
+    /// frame — hanya untuk build DEBUG, ATAU saat app secara eksplisit meng-enable
+    /// flag inisialisasi `plugins.FaceRecognition.enableInsecureFramePath` di
+    /// capacitor.config (integrasi webview legacy yang sudah sadar risiko).
+    private var insecureFramePathAllowed: Bool {
+        if debugAllowed { return true }
+        return getConfig().getBoolean("enableInsecureFramePath", false)
+    }
+
     private func checkRateLimit() -> Bool {
         let now = Date()
         sessionAttempts.removeAll { now.timeIntervalSince($0) > sessionAttemptWindow }
         if sessionAttempts.count >= maxSessionAttempts { return false }
         sessionAttempts.append(now)
         return true
+    }
+
+    // ============================
+    // Challenge session (liveness-v3, P0) — anti pemilihan challenge dari JS
+    // ============================
+    // Challenge SELALU dibuat native (acak) dan berlaku single-use + expiry.
+    // verifyFaceSequence membaca arah challenge dari session ini, BUKAN dari
+    // input JS — menutup celah "kirim challenge yang cocok dengan video".
+    private struct ChallengeSession {
+        let id: String
+        let challenge: String
+        let expiresAt: Date
+        var consumed: Bool
+    }
+
+    private enum ChallengeLookup {
+        case ok(ChallengeSession)
+        case missing
+        case expired
+        case consumed
+    }
+
+    private var activeChallenge: ChallengeSession?
+    private let challengeLock = NSLock()
+
+    /// Membuat challenge session baru (acak) — menggantikan yang lama.
+    private func issueChallengeSession() -> ChallengeSession {
+        let session = ChallengeSession(
+            id: UUID().uuidString,
+            challenge: Int.random(in: 0...1) == 0 ? "LOOK_LEFT" : "LOOK_RIGHT",
+            expiresAt: Date().addingTimeInterval(challengeTTL),
+            consumed: false)
+        challengeLock.lock()
+        activeChallenge = session
+        challengeLock.unlock()
+        return session
+    }
+
+    /// Mengambil SEKALIGUS mengonsumsi challenge session untuk `id`.
+    /// Percobaan pertama (gagal maupun lulus) memakai sesi — brute-force retry
+    /// dengan challenge yang sama tidak mungkin.
+    private func consumeChallengeSession(id: String?) -> ChallengeLookup {
+        guard let id = id, !id.isEmpty else { return .missing }
+        challengeLock.lock()
+        defer { challengeLock.unlock() }
+        guard var session = activeChallenge, session.id == id else { return .missing }
+        guard Date() < session.expiresAt else { return .expired }
+        guard !session.consumed else { return .consumed }
+        session.consumed = true
+        activeChallenge = session
+        return .ok(session)
     }
 
     /// Menentukan bundle yang tepat untuk mencari model TFLite:
@@ -192,7 +266,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         // 2. Deteksi wajah menggunakan Apple Vision
-        let request = VNDetectFaceRectanglesRequest { [weak self] (req, error) in
+        let request = makeFaceRectanglesRequest { [weak self] (req, error) in
             guard let self = self else { return }
 
             if let err = error {
@@ -321,7 +395,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                     "width":           Int(min(width,  imgWidth  - max(0, x))),
                     "height":          Int(min(height, imgHeight - max(0, y))),
                     "headEulerAngleX": angles.pitch,   // pitch (atas-bawah)
-                    "headEulerAngleY": angles.yaw,     // yaw (kiri-kanan)
+                    "headEulerAngleY": angles.yaw,     // yaw ternormalisasi (positif = menoleh ke kanan anatomis user)
                     "headEulerAngleZ": angles.roll,    // roll (miring)
                 ]
                 // Hanya set jika berhasil dihitung
@@ -398,7 +472,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         // 2. Deteksi wajah menggunakan Apple Vision
-        let request = VNDetectFaceRectanglesRequest { [weak self] (req, error) in
+        let request = makeFaceRectanglesRequest { [weak self] (req, error) in
             guard let self = self else { return }
 
             if let err = error {
@@ -469,7 +543,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     ///   referenceEmbedding?: number[]   → jika ada, sekaligus compare (match)
     ///   config?: {
     ///     liveThreshold?, spoofVeto?, minFaceRatio?, minFrameSide?, edgeMargin?,
-    ///     maxPose?, blurMin?, exposureMin?, exposureMax?, yawSign?, debug?
+    ///     maxPose?, blurMin?, exposureMin?, exposureMax?, yawSignOverride?, debug?
     ///   }
     @objc func verifyFace(_ call: CAPPluginCall) {
         guard antiSpoof27 != nil, antiSpoof40 != nil, interpreter != nil else {
@@ -487,7 +561,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         let config = GateConfig.from(call.getObject("config"), debugAllowed: debugAllowed)
         let referenceEmbedding = call.getArray("referenceEmbedding", Double.self)
 
-        let request = VNDetectFaceRectanglesRequest { [weak self] (req, error) in
+        let request = makeFaceRectanglesRequest { [weak self] (req, error) in
             guard let self = self else { return }
 
             if let err = error {
@@ -574,20 +648,29 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
-    // Active challenge (Fase 3.3)
+    // Active challenge (Fase 3.3, liveness-v3)
     // ============================
-    /// Mengeluarkan challenge acak untuk sesi liveness aktif.
-    /// Aplikasi menampilkan instruksi ke user, lalu memanggil verifyFaceSequence.
-    @objc func getLivenessChallenge(_ call: CAPPluginCall) {
-        let challenge = Int.random(in: 0...1) == 0 ? "LOOK_LEFT" : "LOOK_RIGHT"
-        call.resolve(["challenge": challenge])
+    /// Membuat challenge session (acak, single-use, expiry 60 detik).
+    /// Aplikasi menampilkan instruksi ke user, lalu memanggil verifyFaceSequence
+    /// dengan `challengeId` yang dikembalikan. Challenge TIDAK bisa dipilih dari JS.
+    @objc func createChallengeSession(_ call: CAPPluginCall) {
+        guard checkRateLimit() else {
+            call.reject("Terlalu banyak percobaan sesi liveness. Coba lagi dalam beberapa menit.", "RATE_LIMITED")
+            return
+        }
+        let session = issueChallengeSession()
+        call.resolve([
+            "challengeId": session.id,
+            "challenge": session.challenge,
+            "expiresAt": session.expiresAt.timeIntervalSince1970 * 1000,
+        ])
     }
 
     /// Verifikasi sesi multi-frame dengan active challenge (Fase 3.3).
     ///
     /// options:
     ///   images: string[]            → ≥ 5 frame dalam ~1,5 detik
-    ///   challenge: 'LOOK_LEFT' | 'LOOK_RIGHT'
+    ///   challengeId: string         → dari createChallengeSession (single-use)
     ///   referenceEmbedding?: number[]
     ///   config?: GateConfig (sama dengan verifyFace)
     ///
@@ -600,16 +683,21 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     ///   - challenge terpenuhi: yaw menyimpang ≥ 15° ke arah yang diminta, lalu
     ///     minimal 2 frame kembali mendekati frontal (|yaw| < 15°)
     ///
-    /// CATATAN KONVENSI TANDA YAW: default saat ini LOOK_LEFT = yaw negatif.
-    /// Jika di perangkat ternyata terbalik, set config.yawSign = -1.
-    /// Verifikasi tanda ini bagian dari kalibrasi Fase 5.
+    /// CATATAN KONVENSI YAW (liveness-v3): yaw ternormalisasi di sumber
+    /// (YawConvention) — positif = menoleh ke kanan anatomis user. LOOK_LEFT
+    /// butuh deviasi yaw negatif. Perangkat dengan buffer ter-flip:
+    /// set config.yawSignOverride = -1.
     @objc func verifyFaceSequence(_ call: CAPPluginCall) {
         guard antiSpoof27 != nil, antiSpoof40 != nil, interpreter != nil else {
             call.reject("Model liveness atau face recognition tidak ditemukan di bundle")
             return
         }
-        guard checkRateLimit() else {
-            call.reject("Terlalu banyak percobaan sesi liveness. Coba lagi dalam beberapa menit.", "RATE_LIMITED")
+        // P2.4: jalur frame base64 dari JS = celah injeksi frame — hanya untuk
+        // build debug ATAU saat app meng-enable flag `enableInsecureFramePath`
+        // (lihat insecureFramePathAllowed). Produksi yang memungkinkan sebaiknya
+        // memakai captureLivenessSession.
+        guard insecureFramePathAllowed else {
+            call.reject("verifyFaceSequence (frame base64 dari JS) hanya untuk build debug atau app dengan flag enableInsecureFramePath — gunakan captureLivenessSession di produksi", "INSECURE_FRAME_PATH_DISABLED")
             return
         }
 
@@ -617,9 +705,21 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             call.reject("images minimal berisi 2 frame (disarankan ≥ 5)")
             return
         }
-        let challenge = call.getString("challenge") ?? ""
-        guard challenge == "LOOK_LEFT" || challenge == "LOOK_RIGHT" else {
-            call.reject("challenge harus LOOK_LEFT atau LOOK_RIGHT (dari getLivenessChallenge)")
+        // Challenge dibaca dari session native (acak, single-use, expiry) —
+        // BUKAN dari input JS. Percobaan pertama langsung mengonsumsi sesi.
+        let challengeId = call.getString("challengeId") ?? ""
+        let challenge: String
+        switch consumeChallengeSession(id: challengeId) {
+        case .ok(let session):
+            challenge = session.challenge
+        case .missing:
+            call.reject("challengeId tidak dikenal — panggil createChallengeSession dulu", "CHALLENGE_NOT_FOUND")
+            return
+        case .expired:
+            call.reject("Challenge session kedaluwarsa — buat challenge baru", "CHALLENGE_EXPIRED")
+            return
+        case .consumed:
+            call.reject("Challenge session sudah dipakai — buat challenge baru", "CHALLENGE_CONSUMED")
             return
         }
 
@@ -631,14 +731,17 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
-        let result = finishSequence(frames: frames, config: config,
+        var result = finishSequence(frames: frames, config: config,
                                     challenge: challenge, referenceEmbedding: referenceEmbedding)
+        result["challengeId"] = challengeId
+        result["native"] = false
         call.resolve(result)
     }
 
     /// Proses frame sekuensial (VNImageRequestHandler bersifat sinkron).
     /// Mengembalikan nil jika ada frame gagal di-decode atau Vision error.
-    private func processFrames(base64Frames: [String], config: GateConfig) -> [FrameResult]? {
+    private func processFrames(base64Frames: [String], config: GateConfig,
+                               timestamps: [Double]? = nil) -> [FrameResult]? {
         var frames: [FrameResult] = []
 
         for (index, base64) in base64Frames.enumerated() {
@@ -647,11 +750,14 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                 return nil
             }
 
-            let request = VNDetectFaceRectanglesRequest { [weak self] (req, error) in
+            let request = makeFaceRectanglesRequest { [weak self] (req, error) in
                 guard let self = self else { return }
 
                 var fr = FrameResult()
                 fr.index = index
+                if let ts = timestamps, ts.indices.contains(index) {
+                    fr.timestampMs = ts[index]
+                }
 
                 if let err = error {
                     fr.quality = QualityResult.fail(reason: "NO_FACE", faceRatio: 0, blur: 0)
@@ -746,31 +852,57 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         // ---- Agregasi (median + voting, BUKAN all-live) ----
         let liveScores: [Float] = frames.map { $0.liveness?.liveScore ?? 0 }
         let liveVotes = frames.filter { $0.liveness?.isLive == true }.count
-        let yawValues = frames.filter { $0.quality.passed }.map { $0.yaw }
+        // Yaw sudah ternormalisasi di sumber (YawConvention): positif = menoleh
+        // ke kanan anatomis user. yawSignOverride hanya untuk perangkat dengan
+        // buffer kamera ter-flip — diterapkan SEBELUM agregasi.
+        let yawSamples = frames.filter { $0.quality.passed }
+            .map {
+                ChallengeTrajectory.Sample(
+                    yaw: YawConvention.applyOverride($0.yaw, overrideSign: config.yawSignOverride),
+                    timestampMs: $0.timestampMs)
+            }
+        let yawValues = yawSamples.map { $0.yaw }
         let maxYaw = yawValues.max() ?? 0
         let minYaw = yawValues.min() ?? 0
         let frontalFrames = yawValues.filter { abs($0) < challengeFrontMax }.count
 
         let medianLiveScore = median(liveScores)
-        let requiredVotes = Int(ceil(Double(frames.count) * 0.6))
+        // P2.1: voting sesi diperketat — default SEMUA frame harus isLive.
+        let requiredVotes = Int(ceil(Double(frames.count) * Double(config.minLiveVoteRatio)))
 
-        // Challenge: deviasi yaw ≥ challengeYawMin ke arah yang diminta.
-        // yawSign menormalkan konvensi tanda pada nilai yaw SEBELUM agregasi
-        // min/max — menerapkannya ke min/max (bukan ke nilai yaw) membuat
-        // yawSign=-1 mustahil terpenuhi (minYaw ≥ 15 bertabrakan dengan syarat
-        // >= 2 frame frontal).
-        let yawSign: Float = config.yawSign >= 0 ? 1 : -1
-        let adjMinYaw = yawSign > 0 ? minYaw : -maxYaw
-        let adjMaxYaw = yawSign > 0 ? maxYaw : -minYaw
-        var challengeSatisfied: Bool
-        if challenge == "LOOK_LEFT" {
-            challengeSatisfied = adjMinYaw <= -challengeYawMin
-        } else {
-            challengeSatisfied = adjMaxYaw >= challengeYawMin
+        // Challenge (P1): verifikasi LINTASAN TEMPORAL, bukan min/max agregat —
+        // frontal di awal → deviasi ≥ 15° ke arah challenge → kembali frontal,
+        // tanpa gerakan dua arah (head-shake), dengan gerakan halus.
+        // Lihat ChallengeTrajectory untuk aturan R1–R5.
+        let trajectory = ChallengeTrajectory.evaluate(samples: yawSamples, challenge: challenge)
+        let challengeSatisfied = trajectory.passed
+
+        // ---- Anti-replay (P2) ----
+        // P2.1: veto per-frame — satu frame dengan label spoof (PRINT/REPLAY)
+        // atau spoofScore >= spoofHardVeto langsung menggagalkan sesi,
+        // TANPA toleransi voting.
+        var spoofFrameDetected = false
+        var maxScreenSuspect: Float = 0
+        for fr in frames {
+            guard let live = fr.liveness else { continue }
+            if live.label != "LIVE" || live.spoofScore >= spoofHardVeto {
+                spoofFrameDetected = true
+            }
+            maxScreenSuspect = max(maxScreenSuspect, live.screenSuspectScore)
         }
-        challengeSatisfied = challengeSatisfied && frontalFrames >= challengeMinFrontalFrames
+        // P2.2: veto screen-suspect hanya jika di-set eksplisit (mode ketat opt-in);
+        // default hanya dicatat sebagai soft signal untuk pengumpulan data.
+        let screenVetoTriggered = config.screenSuspectVeto.map { maxScreenSuspect >= $0 } ?? false
+        // P2.3: durasi sesi harus masuk rentang gerakan manusia
+        // (hanya diperiksa jika timestamp diketahui — jalur native capture).
+        let timingOk = trajectory.durationMs <= 0
+            || (trajectory.durationMs >= sessionDurationMinMs
+                && trajectory.durationMs <= sessionDurationMaxMs)
 
         let passed = failureReason == nil
+            && !spoofFrameDetected
+            && !screenVetoTriggered
+            && timingOk
             && medianLiveScore >= config.liveThreshold
             && liveVotes >= requiredVotes
             && identityConsistent
@@ -780,7 +912,18 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             passed: passed, reason: nil, challenge: challenge,
             medianLiveScore: medianLiveScore, liveVotes: liveVotes, frameCount: frames.count,
             maxYaw: maxYaw, minYaw: minYaw, frontalFrames: frontalFrames,
-            identityConsistent: identityConsistent, minIdentityCosine: minIdentityCosine)
+            identityConsistent: identityConsistent, minIdentityCosine: minIdentityCosine,
+            trajectory: trajectory.toJson(), maxScreenSuspect: maxScreenSuspect)
+        if config.debug {
+            ret["yawTrace"] = frames.map { fr -> [String: Any] in
+                var entry: [String: Any] = [
+                    "index": fr.index,
+                    "yaw": YawConvention.applyOverride(fr.yaw, overrideSign: config.yawSignOverride),
+                ]
+                if let ts = fr.timestampMs { entry["timestampMs"] = ts }
+                return entry
+            }
+        }
 
         if passed, let ref = referenceEmbedding, let best = refEmbedding {
             if let score = cosineSimilarity(ref, best.map { Double($0) }) {
@@ -796,8 +939,15 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         if !passed {
             var reason = failureReason
             if reason == nil {
-                if !challengeSatisfied {
-                    reason = "CHALLENGE_FAILED"
+                // Prioritas alasan gagal: spoof > screen > timing > challenge > votes > identitas
+                if spoofFrameDetected {
+                    reason = "SPOOF_FRAME_DETECTED"
+                } else if screenVetoTriggered {
+                    reason = "SCREEN_SUSPECTED"
+                } else if !timingOk {
+                    reason = "TIMING_SUSPECT"
+                } else if !challengeSatisfied {
+                    reason = trajectory.failureReason ?? "CHALLENGE_FAILED"
                 } else if liveVotes < requiredVotes || medianLiveScore < config.liveThreshold {
                     reason = "NOT_LIVE_ENOUGH"
                 } else if !identityConsistent {
@@ -814,7 +964,9 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                                      medianLiveScore: Float, liveVotes: Int, frameCount: Int,
                                      maxYaw: Float, minYaw: Float, frontalFrames: Int,
                                      identityConsistent: Bool,
-                                     minIdentityCosine: Double?) -> [String: Any] {
+                                     minIdentityCosine: Double?,
+                                     trajectory: [String: Any],
+                                     maxScreenSuspect: Float) -> [String: Any] {
         var ret: [String: Any] = [
             "passed": passed,
             "challenge": challenge,
@@ -827,6 +979,10 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             "identityConsistent": identityConsistent,
             // Diagnostik kalibrasi: cosine minimum antar frame sebanding (null jika < 2)
             "minIdentityCosine": minIdentityCosine ?? NSNull(),
+            // Ringkasan lintasan challenge (P1): R1–R5 + statistik yaw
+            "trajectory": trajectory,
+            // Sinyal artefak layar agregat (P2.2) — soft signal kecuali screenSuspectVeto di-set
+            "screenSuspect": maxScreenSuspect,
             "thresholdVersion": thresholdVersion,
         ]
         if let reason = reason {
@@ -844,10 +1000,10 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     /// frame tersebut. Yang kembali ke JS hanya HASIL — bukan frame mentah.
     ///
     /// options:
-    ///   challenge?: 'LOOK_LEFT' | 'LOOK_RIGHT'  → default acak
     ///   referenceEmbedding?: number[]
     ///   config?: LivenessConfig
     ///
+    /// Challenge SELALU dibuat internal (acak) — caller tidak bisa memilih arah.
     /// Response = VerifyFaceSequenceResult + { native, deviceIntegrity, auditId }
     @objc func captureLivenessSession(_ call: CAPPluginCall) {
         guard antiSpoof27 != nil, antiSpoof40 != nil, interpreter != nil else {
@@ -859,10 +1015,9 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
-        var challenge = call.getString("challenge") ?? ""
-        if challenge != "LOOK_LEFT" && challenge != "LOOK_RIGHT" {
-            challenge = Int.random(in: 0...1) == 0 ? "LOOK_LEFT" : "LOOK_RIGHT"
-        }
+        // Challenge SELALU acak dari native — menutup brute-force
+        // "ulangi sesi sampai challenge cocok dengan video yang disiapkan".
+        let challenge = Int.random(in: 0...1) == 0 ? "LOOK_LEFT" : "LOOK_RIGHT"
 
         let config = GateConfig.from(call.getObject("config"), debugAllowed: debugAllowed)
         let referenceEmbedding = call.getArray("referenceEmbedding", Double.self)
@@ -880,15 +1035,15 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
 
                 let captureVC = LivenessCaptureViewController(
-                    challenge: challenge, frameCount: 5, interval: 0.3, warmup: 1.2
+                    challenge: challenge, frameCount: 12, interval: 0.12, warmup: 1.2
                 ) { [weak self] result in
                     guard let self = self else { return }
                     switch result {
                     case .failure(let error):
                         call.reject("Capture gagal: \(error.localizedDescription)")
-                    case .success(let urls):
+                    case .success(let frames):
                         self.processCapturedSession(
-                            call: call, urls: urls, challenge: challenge,
+                            call: call, frames: frames, challenge: challenge,
                             config: config, referenceEmbedding: referenceEmbedding)
                     }
                 }
@@ -899,22 +1054,27 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     /// Verifikasi frame hasil native capture + jejak audit terenkripsi.
-    private func processCapturedSession(call: CAPPluginCall, urls: [URL], challenge: String,
+    private func processCapturedSession(call: CAPPluginCall,
+                                        frames capturedFrames: [LivenessCaptureViewController.CapturedFrame],
+                                        challenge: String,
                                         config: GateConfig, referenceEmbedding: [Double]?) {
         var base64Frames: [String] = []
         var frameBytes: [Data] = []
-        for url in urls {
-            guard let data = try? Data(contentsOf: url) else {
+        var timestamps: [Double] = []
+        for frame in capturedFrames {
+            guard let data = try? Data(contentsOf: frame.url) else {
                 call.reject("Gagal membaca frame capture")
                 return
             }
             frameBytes.append(data)
             base64Frames.append(data.base64EncodedString())
+            timestamps.append(frame.timestampMs)
             // Frame sementara dihapus — salinan terenkripsi disimpan oleh AuditStore
-            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: frame.url)
         }
 
-        guard let frames = processFrames(base64Frames: base64Frames, config: config) else {
+        guard let frames = processFrames(base64Frames: base64Frames, config: config,
+                                         timestamps: timestamps) else {
             call.reject("Gagal memproses frame capture (decode / Vision)")
             return
         }
@@ -1019,6 +1179,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         var isLive: Bool
         var probs27: [Float]
         var probs40: [Float]
+        /// Sinyal artefak layar per frame (P2.2) — soft signal, lihat ScreenSuspect.
+        var screenSuspectScore: Float = 0
 
         func toJson() -> [String: Any] {
             return [
@@ -1026,6 +1188,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                 "liveScore": liveScore,
                 "printScore": printScore,
                 "replayScore": replayScore,
+                "screenSuspectScore": screenSuspectScore,
             ]
         }
 
@@ -1091,7 +1254,35 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         result.isLive = argmax == 1
             && result.liveScore >= cfg.liveThreshold
             && result.spoofScore < cfg.spoofVeto
+        // Sinyal artefak layar per frame (P2.2) — soft signal untuk audit/tuning
+        result.screenSuspectScore = analyzeScreenSuspect(cgImage: cgImage, baseFaceRect: baseFaceRect)
         return result
+    }
+
+    /// Downsample crop wajah ke 32x32 lalu analisis artefak layar (P2.2).
+    private func analyzeScreenSuspect(cgImage: CGImage, baseFaceRect: CGRect) -> Float {
+        let size = 32
+        let imageBounds = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+        let clamped = baseFaceRect.integral.intersection(imageBounds)
+        guard !clamped.isEmpty, let crop = cgImage.cropping(to: clamped) else { return 0 }
+
+        var rawPixels = [UInt8](repeating: 0, count: size * size * 4)
+        guard let context = CGContext(
+            data: &rawPixels, width: size, height: size, bitsPerComponent: 8,
+            bytesPerRow: size * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return 0 }
+        context.interpolationQuality = .low
+        context.draw(crop, in: CGRect(x: 0, y: 0, width: size, height: size))
+
+        var argb = [UInt32](repeating: 0, count: size * size)
+        for i in 0..<(size * size) {
+            let r = UInt32(rawPixels[i * 4])
+            let g = UInt32(rawPixels[i * 4 + 1])
+            let b = UInt32(rawPixels[i * 4 + 2])
+            argb[i] = (r << 16) | (g << 8) | b
+        }
+        return ScreenSuspect.analyze(argb: argb, width: size, height: size).score
     }
 
     /// Menjalankan satu inferensi anti-spoofing untuk satu model dengan crop scale-nya.
@@ -1252,11 +1443,28 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     /// Head angles dari VNFaceObservation (radian) → derajat.
+    // ============================
+    // Vision request factory
+    // ============================
+    /// Pin revision 3 (iOS 15+). CATATAN PENTING: revision ≤2 mengembalikan
+    /// yaw/roll DISKRIT (bin ±45°) dan pitch selalu nil — mematikan akurasi
+    /// challenge 15°. Revision 3 memberi nilai kontinu + pitch (perilaku ini
+    /// dikonfirmasi Apple via DTS; lihat juga tutorial Vision iOS 15).
+    private func makeFaceRectanglesRequest(
+        completionHandler: @escaping VNRequestCompletionHandler
+    ) -> VNDetectFaceRectanglesRequest {
+        let request = VNDetectFaceRectanglesRequest(completionHandler: completionHandler)
+        request.revision = VNDetectFaceRectanglesRequestRevision3
+        return request
+    }
+
     /// Konvensi sama dengan ML Kit Android: X = pitch, Y = yaw, Z = roll.
+    /// Yaw TERNORMALISASI (YawConvention, liveness-v3): hasil POSITIF = user
+    /// menoleh ke kanan anatomisnya — sudah dikoreksi dari yaw mentah Vision.
     private func headAnglesDeg(_ face: VNFaceObservation) -> (pitch: Float, yaw: Float, roll: Float) {
         let rad2deg = Float(180.0 / .pi)
         let pitch = face.pitch.map { Float(truncating: $0) } ?? 0
-        let yaw = face.yaw.map { Float(truncating: $0) } ?? 0
+        let yaw = YawConvention.normalize(rawYaw: face.yaw.map { Float(truncating: $0) } ?? 0)
         let roll = face.roll.map { Float(truncating: $0) } ?? 0
         return (pitch: pitch * rad2deg, yaw: yaw * rad2deg, roll: roll * rad2deg)
     }
@@ -1481,7 +1689,17 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         var exposureMin: Float = 60
         var exposureMax: Float = 200
         var identityThreshold: Double = 0.70
-        var yawSign: Int = 1
+        /// Override tanda yaw per-perangkat (1 atau -1) untuk kasus buffer
+        /// kamera ter-flip (mis. beberapa Samsung/OnePlus). Default 1 —
+        /// konvensi normal sudah ditangani YawConvention di sumber pengukuran.
+        var yawSignOverride: Int = 1
+        /// Rasio minimum frame yang harus isLive per sesi (P2.1). Default 1.0 =
+        /// SEMUA frame harus isLive (paling ketat). Jika pengukuran BPCER di
+        /// example-app menunjukkan user asli sering gagal, turunkan (mis. 0.8) —
+        /// veto per-frame SPOOF_FRAME_DETECTED tetap melindungi anti-replay.
+        var minLiveVoteRatio: Float = 1.0
+        /// Veto screen-suspect per sesi (P2.2) — nil = soft signal saja (default).
+        var screenSuspectVeto: Float? = nil
         var debug: Bool = false
 
         static func from(_ config: JSObject?) -> GateConfig {
@@ -1504,7 +1722,9 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             if let v = config["exposureMin"] as? Double { c.exposureMin = Float(v) }
             if let v = config["exposureMax"] as? Double { c.exposureMax = Float(v) }
             if let v = config["identityThreshold"] as? Double { c.identityThreshold = v }
-            if let v = config["yawSign"] as? Int { c.yawSign = v }
+            if let v = config["yawSignOverride"] as? Int { c.yawSignOverride = v }
+            if let v = config["minLiveVoteRatio"] as? Double { c.minLiveVoteRatio = Float(v) }
+            if let v = config["screenSuspectVeto"] as? Double { c.screenSuspectVeto = Float(v) }
             if let v = config["debug"] as? Bool { c.debug = v && debugAllowed }
             return c
         }
@@ -1542,6 +1762,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         var yaw: Float = 0
         var pitch: Float = 0
         var roll: Float = 0
+        /// Epoch ms saat frame di-capture (native capture) — nil untuk jalur JS base64.
+        var timestampMs: Double? = nil
         var quality: QualityResult = QualityResult.fail(reason: "NO_FACE", faceRatio: 0, blur: 0)
         var liveness: AntiSpoofResult?
         var embedding: [Float]?

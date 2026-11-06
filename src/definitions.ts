@@ -16,6 +16,11 @@ export type SequenceFailureReason =
   | 'QUALITY_FAILED'
   | 'IDENTITY_INCONSISTENT'
   | 'CHALLENGE_FAILED'
+  | 'CHALLENGE_WRONG_DIRECTION'
+  | 'CHALLENGE_NO_RETURN'
+  | 'SPOOF_FRAME_DETECTED'
+  | 'SCREEN_SUSPECTED'
+  | 'TIMING_SUSPECT'
   | 'NOT_LIVE_ENOUGH';
 
 /** Konfigurasi liveness & quality gate — semua opsional (default lihat README). */
@@ -40,10 +45,19 @@ export interface LivenessConfig {
   exposureMax?: number;
   /** Threshold cosine konsistensi identitas antar frame sebanding. Default 0.7 */
   identityThreshold?: number;
-  /** Konvensi tanda yaw untuk challenge (1 atau -1). Default 1.
-   *  Diterapkan ke nilai yaw SEBELUM agregasi min/max. -1 membalik arah challenge
-   *  (mis. untuk frame ter-mirror, atau konvensi tanda platform yang berbeda). */
-  yawSign?: number;
+  /** Override tanda yaw per-perangkat (1 atau -1) untuk kasus buffer kamera
+   *  ter-flip (mis. beberapa Samsung/OnePlus). Default 1. Konvensi arah normal
+   *  sudah dinormalisasi plugin (yaw positif = menoleh ke kanan anatomis user) —
+   *  jangan isi kecuali halaman "Kalibrasi Yaw" example-app menyuruhnya. */
+  yawSignOverride?: number;
+  /** Rasio minimum frame yang harus isLive per sesi (P2.1). Default 1.0 = SEMUA
+   *  frame harus isLive. Turunkan (mis. 0.8) jika pengukuran BPCER menunjukkan
+   *  user asli sering gagal — veto per-frame SPOOF_FRAME_DETECTED tetap aktif. */
+  minLiveVoteRatio?: number;
+  /** Veto screen-suspect per sesi (P2.2), 0..1. Default tidak di-set = soft
+   *  signal saja (skor tetap dilaporkan di hasil & audit). Set eksplisit untuk
+   *  mode ketat: sesi gagal (SCREEN_SUSPECTED) jika skor >= veto. */
+  screenSuspectVeto?: number;
   /** Kembalikan data debug (probs per model). Default false */
   debug?: boolean;
 }
@@ -56,6 +70,8 @@ export interface LivenessResult {
   printScore: number;
   /** Probabilitas replay spoof (0..1) */
   replayScore: number;
+  /** Sinyal artefak layar per frame (P2.2) — soft signal eksperimental (0..1) */
+  screenSuspectScore: number;
 }
 
 export interface QualityResult {
@@ -86,20 +102,65 @@ export interface VerifyFaceResult {
   debug?: { probs27: number[]; probs40: number[] };
 }
 
+/** Hasil per-aturan lintasan challenge (P1) — lihat ChallengeTrajectory. */
+export interface TrajectoryRulesPassed {
+  /** R1 — frame awal mendekati frontal (|yaw| < 8°) */
+  frontalStart: boolean;
+  /** R2 — ada deviasi ≥ 15° ke arah challenge, setelah fase awal */
+  deviation: boolean;
+  /** R3 — frame akhir kembali mendekati frontal (|yaw| < 12°) */
+  returnFrontal: boolean;
+  /** R4 — tanpa gerakan berkelanjutan ke arah SALAH (deviasi < 12°) — menolak head-shake */
+  singleDirection: boolean;
+  /** R5 — gerakan halus berkelanjutan (≥ 3 delta searah pada nilai ter-filter median-3) */
+  smoothMotion: boolean;
+}
+
+/** Ringkasan lintasan challenge (P1) — selalu ada di hasil sesi. */
+export interface TrajectorySummary {
+  startYaw: number;
+  endYaw: number;
+  /** Deviasi ekstrem ke arah challenge */
+  extremeYaw: number;
+  extremeFrame: number;
+  /** Deviasi teramati ke arah SALAH (diagnostik) */
+  wrongWayMax: number;
+  /** Varians magnitudo delta yaw — mendekati 0 menandai gerakan konstan sempurna (dugaan video-loop) */
+  deltaVariance: number;
+  /** Lintasan "terlalu sempurna" (deltaVariance ≈ 0) — soft signal dugaan video-loop (P2.3) */
+  tooSmooth: boolean;
+  /** Durasi sesi dalam ms (0 jika timestamp tidak tersedia) */
+  durationMs: number;
+  rulesPassed: TrajectoryRulesPassed;
+}
+
 export interface VerifyFaceSequenceResult {
   passed: boolean;
   reason?: SequenceFailureReason;
   challenge: ChallengeType;
+  /** Present on verifyFaceSequence results (from createChallengeSession). */
+  challengeId?: string;
+  /** false = jalur JS base64 (dev-only), true = native capture (produksi) */
+  native: boolean;
   medianLiveScore: number;
   liveVotes: number;
   frameCount: number;
+  /** Max normalized yaw across quality-passed frames (positive = user's anatomical right) */
   maxYaw: number;
+  /** Min normalized yaw across quality-passed frames (negative = user's anatomical left) */
   minYaw: number;
   frontalFrames: number;
   identityConsistent: boolean;
   /** Cosine minimum antara frame sebanding terhadap frame referensi (paling frontal).
    *  null jika kurang dari 2 frame sebanding. Untuk diagnostik kalibrasi. */
   minIdentityCosine: number | null;
+  /** Ringkasan lintasan challenge (aturan R1–R5 + statistik yaw) */
+  trajectory: TrajectorySummary;
+  /** Sinyal artefak layar agregat (P2.2) — max antar frame; soft signal kecuali
+   *  screenSuspectVeto di-set (mode ketat → SCREEN_SUSPECTED). */
+  screenSuspect: number;
+  /** Trace yaw per frame — HANYA jika config.debug (build debug) */
+  yawTrace?: { index: number; yaw: number; timestampMs?: number }[];
   thresholdVersion: string;
   match?: MatchResult;
 }
@@ -181,6 +242,8 @@ export interface FaceRecognitionPlugin {
    * iOS: uses VNDetectFaceLandmarksRequest for eye landmarks (EAR-based).
    * Android: uses ML Kit with CLASSIFICATION_MODE_ALL.
    * Angles are in DEGREES on both platforms (iOS converts from radians).
+   * headEulerAngleY (yaw) is NORMALIZED: positive = user's anatomical right,
+   * negative = user's anatomical left (same convention as the challenge).
    *
    * @param options.imageBase64 - Image in Base64 format
    * @returns count - Number of detected faces
@@ -195,7 +258,7 @@ export interface FaceRecognitionPlugin {
       height: number;
       /** Up-down head rotation in degrees (pitch) */
       headEulerAngleX: number;
-      /** Left-right head rotation in degrees (yaw) */
+      /** Left-right head rotation in degrees (yaw, normalized: positive = user's anatomical right) */
       headEulerAngleY: number;
       /** Tilt head rotation in degrees (roll) */
       headEulerAngleZ: number;
@@ -218,28 +281,57 @@ export interface FaceRecognitionPlugin {
   }): Promise<VerifyFaceResult>;
 
   /**
-   * Issues a random active challenge for a liveness session.
-   * Show the instruction to the user, capture frames, then call verifyFaceSequence.
+   * Creates a native challenge session (random direction, single-use, 60s expiry).
+   * Show the instruction to the user, capture frames, then call verifyFaceSequence
+   * with the returned challengeId. The challenge direction CANNOT be chosen
+   * from JS — it is always generated natively.
    */
-  getLivenessChallenge(): Promise<{ challenge: ChallengeType }>;
+  createChallengeSession(): Promise<{
+    challengeId: string;
+    challenge: ChallengeType;
+    /** Expiry as Unix epoch milliseconds */
+    expiresAt: number;
+  }>;
 
   /**
    * Multi-frame verification with active challenge (helper in plugin).
    *
+   * DEV/QA-ONLY-BY-DEFAULT: this path accepts base64 frames from JS (a
+   * frame-injection surface) and is therefore only available on DEBUG builds,
+   * OR when the host app explicitly opts in via the Capacitor config flag
+   * `plugins.FaceRecognition.enableInsecureFramePath: true` (legacy webview
+   * integrations that accept the risk). Production should prefer
+   * captureLivenessSession. The result always carries `native: false`.
+   *
    * Pass >= 5 frames captured over ~1.5 seconds. Passing rules:
    * - every frame must pass the quality gate
-   * - median liveScore >= liveThreshold AND majority of frames isLive (voting,
-   *   NOT "all frames must live")
+   * - anti-replay (P2): NO frame may be a hard spoof (label PRINT/REPLAY or
+   *   spoofScore >= 0.5 → SPOOF_FRAME_DETECTED), the session duration must look
+   *   human (TIMING_SUSPECT), and screenSuspectVeto, when configured, must not
+   *   be reached (SCREEN_SUSPECTED)
+   * - live voting: `minLiveVoteRatio` of frames must be isLive (default 1.0 =
+   *   ALL frames) AND median liveScore >= liveThreshold
    * - identity consistent among pose-comparable frames (|yaw| <= 12 deg):
    *   cosine >= identityThreshold (default 0.7) vs the MOST FRONTAL frame.
    *   Frames with |yaw| > 12 deg serve the challenge only and are excluded —
    *   their embeddings are not pose-invariant.
-   * - challenge satisfied: yaw deviates >= 15 deg in the requested direction,
-   *   then >= 2 frames return near frontal (|yaw| < 15 deg)
+   * - challenge satisfied — verified as a TEMPORAL TRAJECTORY (not min/max):
+   *   R1 start near frontal (|yaw| < 8 deg) → R2 deviation >= 15 deg toward the
+   *   requested direction (yaw is normalized: positive = user's anatomical
+   *   right; LOOK_LEFT needs a NEGATIVE deviation) → R3 return near frontal
+   *   (|yaw| < 12 deg), with R4 no sustained movement toward the wrong
+   *   direction (< 12 deg — rejects head-shakes) and R5 sustained smooth
+   *   motion (>= 3 same-direction deltas, median-3 filtered).
+   *   Failure reasons: CHALLENGE_WRONG_DIRECTION (R4), CHALLENGE_NO_RETURN (R3),
+   *   CHALLENGE_FAILED (R1/R2/R5).
+   *
+   * The challenge direction is read from the native challenge session
+   * (single-use) — never from JS input.
    */
   verifyFaceSequence(options: {
     images: string[];
-    challenge: ChallengeType;
+    /** From createChallengeSession — consumed on the FIRST attempt (single-use). */
+    challengeId: string;
     referenceEmbedding?: number[];
     config?: LivenessConfig;
   }): Promise<VerifyFaceSequenceResult>;
@@ -255,10 +347,12 @@ export interface FaceRecognitionPlugin {
    * The session is rate-limited (max 10 attempts per 5 minutes) and logged to
    * an encrypted local audit store for HRIS fraud review.
    *
+   * The challenge direction is ALWAYS generated natively at random — it cannot
+   * be chosen by the caller.
+   *
    * Requires camera permission (requested automatically).
    */
   captureLivenessSession(options: {
-    challenge?: ChallengeType;
     referenceEmbedding?: number[];
     config?: LivenessConfig;
   }): Promise<NativeSessionResult>;
