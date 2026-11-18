@@ -5,7 +5,7 @@ Format per versi. Install versi tertentu: `npm i capacitor-face-recognition-tfli
 | Versi | dist-tag | Catatan |
 |-------|----------|---------|
 | 1.0.1 | `latest` | Pipeline baru + API V2 (di bawah) |
-| 0.0.1 | `v0` | Versi awal (perilaku branch `main`) — `npm i capacitor-face-recognition-tflite@v0` |
+| 0.0.1 | `v0` | Versi awal (perilaku tag `v0.0.1`) — `npm i capacitor-face-recognition-tflite@v0` |
 
 ## 1.0.1
 

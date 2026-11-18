@@ -5,7 +5,7 @@ Paket: `capacitor-face-recognition-tflite`
 | Jalur | Versi | dist-tag | Sumber kode | Install |
 |-------|-------|----------|-------------|---------|
 | **latest** | 1.0.1 (dan seterusnya) | `latest` | branch `fix-bug` (kelak `main`) | `npm i capacitor-face-recognition-tflite` |
-| **legacy** | 0.0.1 | `v0` | branch `main` lama (sudah terbit) | `npm i capacitor-face-recognition-tflite@v0` |
+| **legacy** | 0.0.1 | `v0` | tag `v0.0.1` (commit `558614e`, sudah terbit) | `npm i capacitor-face-recognition-tflite@v0` |
 
 Aturan dasar npm yang berlaku di sini:
 - Versi yang sudah terbit **tidak bisa** ditimpa atau dipublish ulang.
@@ -68,6 +68,15 @@ npm run deploy
 ---
 
 ## 2. Deploy LEGACY (0.0.1)
+
+Tandai dulu commit 0.0.1 di git (sekali; sudah dibuat lokal, tinggal push):
+
+```bash
+git tag v0.0.1 558614e        # commit yang README-nya identik dengan tarball npm 0.0.1
+git push origin v0.0.1
+```
+
+Jangan mengandalkan `main` sebagai sumber 0.0.1 — setelah merge, `main` berisi 1.x.
 
 0.0.1 **sudah terbit**, jadi tidak perlu dipublish ulang. Yang perlu dilakukan hanya memberi tag `v0` agar mudah dipasang setelah `latest` pindah ke 1.0.1.
 
