@@ -1,6 +1,6 @@
 {
   "name": "capacitor-face-recognition-tflite",
-  "version": "0.0.1",
+  "version": "1.0.1",
   "description": "Capacitor plugin for ML Kit + TFLite face recognition",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
@@ -43,7 +43,10 @@
     "build": "npm run clean && npm run docgen && tsc && rollup -c rollup.config.mjs",
     "clean": "rimraf ./dist",
     "watch": "tsc --watch",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "deploy": "./scripts/deploy.sh",
+    "deploy:dry": "./scripts/deploy.sh --dry-run",
+    "tag:legacy": "npm dist-tag add capacitor-face-recognition-tflite@0.0.1 v0"
   },
   "devDependencies": {
     "@capacitor/android": "^8.0.0",
