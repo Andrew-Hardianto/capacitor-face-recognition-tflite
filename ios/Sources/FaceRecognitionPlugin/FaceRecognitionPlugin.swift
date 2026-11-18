@@ -1,3 +1,4 @@
+import AVFoundation
 import Capacitor
 import CoreImage
 import Foundation
@@ -13,39 +14,188 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     public let jsName = "FaceRecognition"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "extractFaceFeature", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "extractFaceFeatureV2", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "compareFaces", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "compareFacesV2", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "checkLiveness", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "checkLivenessV2", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "detectFaces", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "verifyFace", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "createChallengeSession", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "verifyFaceSequence", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "captureLivenessSession", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getDeviceIntegrity", returnType: CAPPluginReturnPromise),
     ]
 
     // ============================
-    // Konfigurasi — Face Recognition
+    // Konfigurasi — Face Recognition (MobileFaceNet)
     // ============================
     // Nama file model tanpa ekstensi (harus ada di bundle: mobile_face_net.tflite)
     private let modelName = "mobile_face_net"
     // Ukuran input model MobileFaceNet
     private let inputSize = 112
-    // Ukuran output embedding
-    private let embeddingSize = 128
+    // Ukuran output embedding — terverifikasi dari tensor output model: shape (1, 192)
+    private let embeddingSize = 192
+    // Threshold cosine similarity untuk face match
+    // CATATAN: default ini BELUM dikalibrasi dengan data sendiri (Fase 5)
+    private let matchThreshold: Double = 0.75
 
     // ============================
-    // Konfigurasi — Anti-Spoofing (Liveness Detection)
+    // Konfigurasi — Anti-Spoofing (Silent-Face / minivision-ai)
     // ============================
-    // Nama file model anti-spoofing tanpa ekstensi (harus ada di bundle: anti_spoof.tflite)
-    // Model: MiniFASNetV1 dari shubham0204/OnDevice-Face-Recognition-Android
+    // Dua model dengan crop scale masing-masing (sesuai referensi):
+    //   anti_spoof_2_7.tflite = spoof_model_scale_2_7.tflite (crop 2.7x)
+    //   anti_spoof_4_0.tflite = spoof_model_scale_4_0.tflite (crop 4.0x)
     // Source: https://github.com/shubham0204/OnDevice-Face-Recognition-Android
-    private let antiSpoofModelName = "anti_spoof"
-    // MiniFASNet menggunakan input 80x80 (bukan 128x128)
+    private let antiSpoofModelName27 = "anti_spoof_2_7"
+    private let antiSpoofModelName40 = "anti_spoof_4_0"
+    // Nama file legacy — fallback untuk bundle lama yang masih memakai anti_spoof.tflite
+    private let antiSpoofModelNameLegacy = "anti_spoof"
+    // MiniFASNet menggunakan input 80x80
     private let antiSpoofInputSize = 80
-    // Output model: 3 kelas softmax → [live_score, print_spoof_score, replay_spoof_score]
-    // Index 0 = live (wajah asli)
+    // Output model: 3 kelas → [print_spoof, live, replay_spoof]
+    // Index 1 = LIVE (wajah asli). Urutan ini hasil verifikasi empiris terhadap
+    // model referensi, BUKAN dari komentar kode lama.
     private let antiSpoofOutputSize = 3
-    // Threshold liveness (HRIS production): skor live di atas ini dianggap Live
-    // Dinaikkan ke 0.75 untuk mencegah foto/replay di lingkungan HRIS
-    private let livenessThreshold: Float = 0.75
-    // Scale factor untuk multi-scale inference (sesuai paper MiniFASNet)
-    // Scale 1.0 = crop ketat, Scale 2.7 = crop lebar (tangkap artefak tepi foto/layar)
-    private let antiSpoofScales: [CGFloat] = [1.0, 2.7]
+    // Crop scale per model (sesuai referensi Silent-Face; TIDAK ada scale 1.0)
+    private let cropScale27: CGFloat = 2.7
+    private let cropScale40: CGFloat = 4.0
+
+    // ============================
+    // Konfigurasi LEGACY (perilaku branch main) — dipakai checkLiveness (non-V2)
+    // ============================
+    // Satu model (anti_spoof_2_7 = anti_spoof.tflite lama), multi-scale 1.0 & 2.7, rata-rata skor
+    private let legacyLivenessThreshold: Float = 0.75
+    private let legacyAntiSpoofScales: [CGFloat] = [1.0, 2.7]
+
+    // ============================
+    // Threshold — SATU sumber kebenaran (Fase 1)
+    // ============================
+    // Keputusan live (Fase 2.4):
+    //   p = softmax(out27) + softmax(out40)        (rentang 0..2)
+    //   label = argmax(p); liveScore = p[1]/2; spoofScore = max(p[0],p[2])/2
+    //   isLive = label==1 && liveScore >= liveThreshold && spoofScore < spoofVeto
+    private let liveThreshold: Float = 0.80
+    private let spoofVeto: Float = 0.20
+    // Versi threshold — disertakan di setiap hasil agar perubahan semantik terlacak
+    private let thresholdVersion = "liveness-v3"
+    private let matchThresholdVersion = "match-v1"
+
+    // ============================
+    // Quality gate (Fase 3.1) — semua bisa di-override via config
+    // ============================
+    private let minFrameSide = 480
+    private let minFaceRatio: Float = 0.25
+    private let edgeMargin: Float = 0.05
+    private let maxPoseDeg: Float = 20
+    private let blurMin: Float = 50           // variance of Laplacian (perlu kalibrasi Fase 5)
+    private let exposureMin: Float = 60
+    private let exposureMax: Float = 200
+    // Konsistensi identitas antar frame (verifyFaceSequence)
+    private let identityMaxPose: Float = 12
+    // Active challenge
+    // CATATAN KONVENSI (liveness-v3): yaw sudah ternormalisasi di sumber
+    // pengukuran (YawConvention) — positif = user menoleh ke kanan anatomisnya.
+    // LOOK_LEFT butuh deviasi yaw NEGATIF; LOOK_RIGHT positif.
+    // Threshold aturan lintasan (R1–R5) ada di ChallengeTrajectory.Thresholds.
+    private let challengeFrontMax: Float = 15   // pelaporan field frontalFrames
+    // Challenge session (P0): challenge dikeluarkan native, single-use + expiry.
+    // JS tidak bisa memilih arah challenge — lihat createChallengeSession.
+    private let challengeTTL: TimeInterval = 60
+
+    // ============================
+    // Pertahanan berlapis (Fase 4)
+    // ============================
+    // Rate limiting percobaan sesi liveness (anti brute-force threshold/serangan beruntun)
+    private let maxSessionAttempts = 10
+    private let sessionAttemptWindow: TimeInterval = 5 * 60
+    private var sessionAttempts: [Date] = []
+    // Anti-replay (P2): veto per-frame + timing sesi
+    // spoofHardVeto: satu frame dengan label spoof (PRINT/REPLAY) atau
+    //   spoofScore >= veto ini → sesi GAGAL (SPOOF_FRAME_DETECTED), tanpa toleransi voting.
+    private let spoofHardVeto: Float = 0.5
+    // Rentang durasi sesi yang wajar untuk gerakan manusia (12 frame @ ~120ms).
+    // Ambang atas 5s (bukan 3s seperti plan) untuk toleransi latensi capture
+    // perangkat lambat — capture berantai mengukur interval SETELAH frame selesai.
+    private let sessionDurationMinMs: Double = 1000
+    private let sessionDurationMaxMs: Double = 5000
+
+    /// Output debug hanya diizinkan pada build DEBUG (Fase 4).
+    private var debugAllowed: Bool {
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// P2.4: jalur frame base64 dari JS (verifyFaceSequence) adalah celah injeksi
+    /// frame — hanya untuk build DEBUG, ATAU saat app secara eksplisit meng-enable
+    /// flag inisialisasi `plugins.FaceRecognition.enableInsecureFramePath` di
+    /// capacitor.config (integrasi webview legacy yang sudah sadar risiko).
+    private var insecureFramePathAllowed: Bool {
+        if debugAllowed { return true }
+        return getConfig().getBoolean("enableInsecureFramePath", false)
+    }
+
+    private func checkRateLimit() -> Bool {
+        let now = Date()
+        sessionAttempts.removeAll { now.timeIntervalSince($0) > sessionAttemptWindow }
+        if sessionAttempts.count >= maxSessionAttempts { return false }
+        sessionAttempts.append(now)
+        return true
+    }
+
+    // ============================
+    // Challenge session (liveness-v3, P0) — anti pemilihan challenge dari JS
+    // ============================
+    // Challenge SELALU dibuat native (acak) dan berlaku single-use + expiry.
+    // verifyFaceSequence membaca arah challenge dari session ini, BUKAN dari
+    // input JS — menutup celah "kirim challenge yang cocok dengan video".
+    private struct ChallengeSession {
+        let id: String
+        let challenge: String
+        let expiresAt: Date
+        var consumed: Bool
+    }
+
+    private enum ChallengeLookup {
+        case ok(ChallengeSession)
+        case missing
+        case expired
+        case consumed
+    }
+
+    private var activeChallenge: ChallengeSession?
+    private let challengeLock = NSLock()
+
+    /// Membuat challenge session baru (acak) — menggantikan yang lama.
+    private func issueChallengeSession() -> ChallengeSession {
+        let session = ChallengeSession(
+            id: UUID().uuidString,
+            challenge: Int.random(in: 0...1) == 0 ? "LOOK_LEFT" : "LOOK_RIGHT",
+            expiresAt: Date().addingTimeInterval(challengeTTL),
+            consumed: false)
+        challengeLock.lock()
+        activeChallenge = session
+        challengeLock.unlock()
+        return session
+    }
+
+    /// Mengambil SEKALIGUS mengonsumsi challenge session untuk `id`.
+    /// Percobaan pertama (gagal maupun lulus) memakai sesi — brute-force retry
+    /// dengan challenge yang sama tidak mungkin.
+    private func consumeChallengeSession(id: String?) -> ChallengeLookup {
+        guard let id = id, !id.isEmpty else { return .missing }
+        challengeLock.lock()
+        defer { challengeLock.unlock() }
+        guard var session = activeChallenge, session.id == id else { return .missing }
+        guard Date() < session.expiresAt else { return .expired }
+        guard !session.consumed else { return .consumed }
+        session.consumed = true
+        activeChallenge = session
+        return .ok(session)
+    }
 
     /// Menentukan bundle yang tepat untuk mencari model TFLite:
     /// - Swift Package Manager (SPM): gunakan `Bundle.module` (bundle plugin itu sendiri)
@@ -77,22 +227,35 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }()
 
-    // TFLite Interpreter — Anti-Spoofing (lazy, nullable — tidak crash jika model tidak ada)
-    private lazy var antiSpoofInterpreter: Interpreter? = {
-        // modelBundle otomatis memilih Bundle.module (SPM) atau Bundle.main (CocoaPods)
-        guard let modelPath = modelBundle.path(forResource: antiSpoofModelName, ofType: "tflite") else {
-            print("[FaceRecognitionPlugin] INFO: File '\(antiSpoofModelName).tflite' tidak ditemukan di bundle. checkLiveness tidak akan tersedia.")
-            return nil
-        }
-        do {
-            let interpreter = try Interpreter(modelPath: modelPath)
-            try interpreter.allocateTensors()
-            return interpreter
-        } catch {
-            print("[FaceRecognitionPlugin] ERROR: Gagal membuat antiSpoofInterpreter: \(error)")
-            return nil
-        }
+    // TFLite Interpreter — Anti-Spoofing dua model (lazy, nullable — tidak crash jika model tidak ada)
+    // Interpreter TIDAK thread-safe → semua akses wajib melalui lock yang sesuai
+    private lazy var antiSpoof27: Interpreter? = {
+        return loadAntiSpoofModel(names: [antiSpoofModelName27, antiSpoofModelNameLegacy])
     }()
+
+    private lazy var antiSpoof40: Interpreter? = {
+        return loadAntiSpoofModel(names: [antiSpoofModelName40])
+    }()
+
+    private let antiSpoof27Lock = NSLock()
+    private let antiSpoof40Lock = NSLock()
+    private let embeddingLock = NSLock()
+
+    private func loadAntiSpoofModel(names: [String]) -> Interpreter? {
+        for name in names {
+            if let modelPath = modelBundle.path(forResource: name, ofType: "tflite") {
+                do {
+                    let interpreter = try Interpreter(modelPath: modelPath)
+                    try interpreter.allocateTensors()
+                    return interpreter
+                } catch {
+                    print("[FaceRecognitionPlugin] ERROR: Gagal membuat antiSpoofInterpreter (\(name)): \(error)")
+                }
+            }
+        }
+        print("[FaceRecognitionPlugin] INFO: Model anti-spoofing \(names) tidak ditemukan di bundle. checkLiveness tidak akan tersedia.")
+        return nil
+    }
 
     // ============================
     // extractFaceFeature
@@ -194,6 +357,61 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
+    // extractFaceFeature
+    // ============================
+    @objc func extractFaceFeatureV2(_ call: CAPPluginCall) {
+        // Pastikan interpreter berhasil dimuat
+        guard interpreter != nil else {
+            call.reject("Model TFLite gagal dimuat. Pastikan file '\(modelName).tflite' ada di bundle iOS.")
+            return
+        }
+
+        // 1. Decode Base64 ke UIImage (orientasi sudah dinormalisasi)
+        guard let image = decodeOrientedImage(call.getString("imageBase64") ?? ""),
+              let cgImage = image.cgImage
+        else {
+            call.reject("Gagal decode Base64 menjadi gambar")
+            return
+        }
+
+        // 2. Deteksi wajah menggunakan Apple Vision
+        let request = makeFaceRectanglesRequest { [weak self] (req, error) in
+            guard let self = self else { return }
+
+            if let err = error {
+                call.reject("Vision gagal mendeteksi: \(err.localizedDescription)")
+                return
+            }
+
+            guard let results = req.results as? [VNFaceObservation],
+                  let face = self.pickLargestFace(results)
+            else {
+                call.reject("Tidak ada wajah yang terdeteksi")
+                return
+            }
+
+            // 3. Konversi bounding box Vision (koordinat dari kiri bawah → kiri atas)
+            let faceRect = self.pixelRect(from: face, imgWidth: image.size.width, imgHeight: image.size.height)
+
+            // 4. Ekstrak embedding dari frame dan bbox yang sama
+            guard let embeddings = self.extractEmbedding(cgImage: cgImage, faceRect: faceRect) else {
+                call.reject("Gagal menjalankan inference face recognition")
+                return
+            }
+
+            call.resolve(["embedding": embeddings])
+        }
+
+        // Eksekusi Vision Request
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            call.reject("Gagal menjalankan Vision Request: \(error.localizedDescription)")
+        }
+    }
+
+    // ============================
     // compareFaces
     // ============================
     @objc func compareFaces(_ call: CAPPluginCall) {
@@ -237,20 +455,46 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
+    // compareFaces
+    // ============================
+    @objc func compareFacesV2(_ call: CAPPluginCall) {
+        guard let vec1 = call.getArray("vector1", Double.self),
+              let vec2 = call.getArray("vector2", Double.self),
+              vec1.count == vec2.count
+        else {
+            call.reject("Vector tidak valid atau panjangnya tidak sama")
+            return
+        }
+
+        guard let cosineSimilarity = cosineSimilarity(vec1, vec2) else {
+            call.reject("Data vektor ada yang bernilai nol semua, cek apakah embedding berhasil")
+            return
+        }
+
+        let isMatch = cosineSimilarity > matchThreshold
+        let similarityPercentage = max(0, cosineSimilarity * 100.0)
+
+        call.resolve([
+            "isMatch": isMatch,
+            "similarityPercentage": similarityPercentage,
+            "score": cosineSimilarity,
+            "threshold": matchThreshold,
+            "thresholdVersion": matchThresholdVersion,
+        ])
+    }
+
+    // ============================
     // detectFaces
     // ============================
     /// Mendeteksi semua wajah dalam gambar menggunakan Apple Vision dengan landmarks.
-    /// Mengembalikan jumlah wajah, bounding box, eye open probability, dan head angle.
+    /// Mengembalikan jumlah wajah, bounding box, euler angles (X/Y/Z, derajat),
+    /// dan eye open probability.
     ///
-    /// Berguna untuk:
-    ///   - Validasi awal: pastikan tepat 1 wajah sebelum extractFaceFeature
-    ///   - Blink detection untuk liveness challenge di layer JS (HRIS production)
-    ///   - Koordinat wajah untuk UI overlay
+    /// CATATAN: sudut dari Vision dikonversi dari radian ke derajat agar konsisten
+    /// dengan dokumentasi API dan platform Android.
     @objc func detectFaces(_ call: CAPPluginCall) {
-        // 1. Decode Base64 ke UIImage
-        guard let imageBase64 = call.getString("imageBase64"),
-              let data = Data(base64Encoded: imageBase64, options: .ignoreUnknownCharacters),
-              let image = UIImage(data: data),
+        // 1. Decode Base64 ke UIImage (orientasi sudah dinormalisasi)
+        guard let image = decodeOrientedImage(call.getString("imageBase64") ?? ""),
               let cgImage = image.cgImage
         else {
             call.reject("Gagal decode Base64 menjadi gambar")
@@ -275,14 +519,14 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             for face in results {
                 let bb = face.boundingBox
 
-                // 3. Konversi bounding box Vision (kiri-bawah, normalized) → piksel (kiri-atas)
+                // Konversi bounding box Vision (kiri-bawah, normalized) → piksel (kiri-atas)
                 let x      = bb.origin.x * imgWidth
                 let y      = (1 - bb.origin.y - bb.size.height) * imgHeight
                 let width  = bb.size.width  * imgWidth
                 let height = bb.size.height * imgHeight
 
-                // Head roll angle dari Vision (yaw tidak tersedia)
-                let roll = face.roll?.doubleValue ?? 0.0
+                // Head angles dari Vision (radian) → derajat
+                let angles = self.headAnglesDeg(face)
 
                 // Estimasi eye open probability dari Eye Aspect Ratio (EAR) landmark mata
                 var leftEyeOpenProb: Double = -1.0
@@ -290,31 +534,10 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
 
                 if let landmarks = face.landmarks {
                     if let leftEye = landmarks.leftEye {
-                        let pts = leftEye.normalizedPoints
-                        if pts.count >= 4 {
-                            let ys = pts.map { $0.y }
-                            let xs = pts.map { $0.x }
-                            let eyeHeight = (ys.max() ?? 0) - (ys.min() ?? 0)
-                            let eyeWidth  = (xs.max() ?? 0) - (xs.min() ?? 0)
-                            if eyeWidth > 0 {
-                                let ear = eyeHeight / eyeWidth
-                                // EAR: ~0.05 = tutup, ~0.3 = buka penuh
-                                leftEyeOpenProb = min(1.0, max(0.0, Double((ear - 0.05) / 0.25)))
-                            }
-                        }
+                        leftEyeOpenProb = self.eyeOpenProbability(from: leftEye.normalizedPoints)
                     }
                     if let rightEye = landmarks.rightEye {
-                        let pts = rightEye.normalizedPoints
-                        if pts.count >= 4 {
-                            let ys = pts.map { $0.y }
-                            let xs = pts.map { $0.x }
-                            let eyeHeight = (ys.max() ?? 0) - (ys.min() ?? 0)
-                            let eyeWidth  = (xs.max() ?? 0) - (xs.min() ?? 0)
-                            if eyeWidth > 0 {
-                                let ear = eyeHeight / eyeWidth
-                                rightEyeOpenProb = min(1.0, max(0.0, Double((ear - 0.05) / 0.25)))
-                            }
-                        }
+                        rightEyeOpenProb = self.eyeOpenProbability(from: rightEye.normalizedPoints)
                     }
                 }
 
@@ -323,8 +546,9 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
                     "y":               Int(max(0, y)),
                     "width":           Int(min(width,  imgWidth  - max(0, x))),
                     "height":          Int(min(height, imgHeight - max(0, y))),
-                    "headEulerAngleY": 0.0,  // tidak tersedia di Vision Framework
-                    "headEulerAngleZ": roll,
+                    "headEulerAngleX": angles.pitch,   // pitch (atas-bawah)
+                    "headEulerAngleY": angles.yaw,     // yaw ternormalisasi (positif = menoleh ke kanan anatomis user)
+                    "headEulerAngleZ": angles.roll,    // roll (miring)
                 ]
                 // Hanya set jika berhasil dihitung
                 if leftEyeOpenProb >= 0 { faceDict["leftEyeOpenProbability"]  = leftEyeOpenProb }
@@ -342,7 +566,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         // 6. Eksekusi Vision Request
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         do {
-            try handler.perform([landmarksRequest])
+            try handler.perform([request])
         } catch {
             call.reject("Gagal menjalankan Vision Request: \(error.localizedDescription)")
         }
@@ -384,10 +608,10 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     /// Memerlukan file 'anti_spoof.tflite' di bundle iOS.
     @objc func checkLiveness(_ call: CAPPluginCall) {
         // Periksa apakah model anti-spoofing tersedia
-        guard let antiSpoofInterpreter = antiSpoofInterpreter else {
+        guard let antiSpoofInterpreter = antiSpoof27 else {
             call.reject(
                 "Model anti-spoofing tidak ditemukan. " +
-                "Letakkan file '\(antiSpoofModelName).tflite' di bundle iOS Xcode project. " +
+                "Letakkan file '\(antiSpoofModelNameLegacy).tflite' di bundle iOS Xcode project. " +
                 "Download model dari: https://github.com/minivision-ai/Silent-Face-Anti-Spoofing"
             )
             return
@@ -434,8 +658,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             // 3. Multi-Scale Inference: jalankan anti-spoof untuk setiap scale
             var scaleScores: [Float] = []
 
-            for scaleFactor in self.antiSpoofScales {
-                guard let score = self.runAntiSpoofInference(
+            for scaleFactor in self.legacyAntiSpoofScales {
+                guard let score = self.runAntiSpoofInferenceLegacy(
                     interpreter: antiSpoofInterpreter,
                     image: image,
                     cgImage: cgImage,
@@ -459,7 +683,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
             print("[AntiSpoof] Scale scores: \(scaleScores), Final: \(livenessScore)")
 
             // 5. Tentukan apakah live berdasarkan threshold (0.75 untuk HRIS production)
-            let isLive = livenessScore > self.livenessThreshold
+            let isLive = livenessScore > self.legacyLivenessThreshold
 
             // 6. Tentukan tingkat kepercayaan
             let confidence: String
@@ -489,8 +713,852 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
-    // Helper: Multi-Scale Anti-Spoof Inference
+    // checkLiveness — wrapper backward-compatible (Fase 1.3)
     // ============================
+    /// Memeriksa apakah wajah dalam gambar adalah wajah asli (live) atau spoofing.
+    ///
+    /// CATATAN PERUBAHAN SEMANTIK (liveness-v2):
+    ///   Versi lama menghitung rata-rata skor live antar scale (1.0 & 2.7) tanpa
+    ///   argmax kelas. Versi ini memakai pipeline referensi Silent-Face:
+    ///   dua model (crop 2.7 & 4.0), softmax dijumlahkan, argmax 3 kelas, plus
+    ///   syarat liveScore dan veto spoofScore. Field "score" kini dipetakan ke
+    ///   liveScore pasca-argmax — NILAINYA TIDAK SEBANDING dengan versi lama.
+    ///
+    /// Response lama {isLive, score, confidence} tetap ada, ditambah field baru:
+    ///   label, liveScore, printScore, replayScore, thresholdVersion.
+    @objc func checkLivenessV2(_ call: CAPPluginCall) {
+        // Periksa apakah model anti-spoofing tersedia
+        guard antiSpoof27 != nil, antiSpoof40 != nil else {
+            call.reject(
+                "Model anti-spoofing tidak ditemukan. " +
+                "Letakkan file '\(antiSpoofModelName27).tflite' dan '\(antiSpoofModelName40).tflite' di bundle iOS Xcode project. " +
+                "Download model dari: https://github.com/shubham0204/OnDevice-Face-Recognition-Android"
+            )
+            return
+        }
+
+        // 1. Decode Base64 ke UIImage (orientasi sudah dinormalisasi)
+        guard let image = decodeOrientedImage(call.getString("imageBase64") ?? ""),
+              let cgImage = image.cgImage
+        else {
+            call.reject("Gagal decode Base64 menjadi gambar")
+            return
+        }
+
+        // 2. Deteksi wajah menggunakan Apple Vision
+        let request = makeFaceRectanglesRequest { [weak self] (req, error) in
+            guard let self = self else { return }
+
+            if let err = error {
+                call.reject("Vision gagal mendeteksi: \(err.localizedDescription)")
+                return
+            }
+
+            guard let results = req.results as? [VNFaceObservation],
+                  let face = self.pickLargestFace(results)
+            else {
+                call.reject("Tidak ada wajah yang terdeteksi untuk pemeriksaan liveness")
+                return
+            }
+
+            let baseFaceRect = self.pixelRect(from: face, imgWidth: image.size.width, imgHeight: image.size.height)
+
+            // 3. Pipeline anti-spoof (dua model, crop shift, argmax + veto)
+            guard let result = self.runAntiSpoofPipeline(
+                cgImage: cgImage,
+                baseFaceRect: baseFaceRect,
+                imgWidth: image.size.width,
+                imgHeight: image.size.height
+            ) else {
+                call.reject("Gagal menjalankan anti-spoof inference")
+                return
+            }
+
+            // 4. Tentukan tingkat kepercayaan (kompatibel dengan response lama)
+            let confidence: String
+            if result.liveScore > 0.85 || result.liveScore < 0.15 {
+                confidence = "HIGH"
+            } else if result.liveScore > 0.6 || result.liveScore < 0.4 {
+                confidence = "MEDIUM"
+            } else {
+                confidence = "LOW"
+            }
+
+            // 5. Kirim hasil ke JavaScript
+            call.resolve([
+                "isLive": result.isLive,
+                "score": result.liveScore,       // dipetakan ke liveScore
+                "confidence": confidence,
+                "label": result.label,
+                "liveScore": result.liveScore,
+                "printScore": result.printScore,
+                "replayScore": result.replayScore,
+                "thresholdVersion": self.thresholdVersion,
+            ])
+        }
+
+        // Eksekusi Vision Request
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            call.reject("Gagal menjalankan Vision Request untuk liveness: \(error.localizedDescription)")
+        }
+    }
+
+    // ============================
+    // verifyFace — API terpadu (Fase 3.2, menutup TOCTOU)
+    // ============================
+    /// Liveness + quality gate + embedding dari FRAME DAN BBOX YANG SAMA.
+    /// Embedding hanya dikembalikan jika isLive = true.
+    ///
+    /// options:
+    ///   imageBase64: string
+    ///   referenceEmbedding?: number[]   → jika ada, sekaligus compare (match)
+    ///   config?: {
+    ///     liveThreshold?, spoofVeto?, minFaceRatio?, minFrameSide?, edgeMargin?,
+    ///     maxPose?, blurMin?, exposureMin?, exposureMax?, yawSignOverride?, debug?
+    ///   }
+    @objc func verifyFace(_ call: CAPPluginCall) {
+        guard antiSpoof27 != nil, antiSpoof40 != nil, interpreter != nil else {
+            call.reject("Model liveness atau face recognition tidak ditemukan di bundle")
+            return
+        }
+
+        guard let image = decodeOrientedImage(call.getString("imageBase64") ?? ""),
+              let cgImage = image.cgImage
+        else {
+            call.reject("Gagal decode Base64 menjadi gambar")
+            return
+        }
+
+        let config = GateConfig.from(call.getObject("config"), debugAllowed: debugAllowed)
+        let referenceEmbedding = call.getArray("referenceEmbedding", Double.self)
+
+        let request = makeFaceRectanglesRequest { [weak self] (req, error) in
+            guard let self = self else { return }
+
+            if let err = error {
+                call.reject("Vision gagal mendeteksi: \(err.localizedDescription)")
+                return
+            }
+
+            let results = req.results as? [VNFaceObservation] ?? []
+
+            // ---- Quality gate (Fase 3.1) ----
+            let quality = self.runQualityGate(
+                cgImage: cgImage, faces: results,
+                imgWidth: image.size.width, imgHeight: image.size.height, config: config)
+            if !quality.passed {
+                call.resolve([
+                    "isLive": false,
+                    "thresholdVersion": self.thresholdVersion,
+                    "liveness": NSNull(),
+                    "quality": quality.toJson(),
+                ])
+                return
+            }
+
+            guard let face = self.pickLargestFace(results) else {
+                call.reject("Tidak ada wajah yang terdeteksi")
+                return
+            }
+            let baseFaceRect = self.pixelRect(from: face, imgWidth: image.size.width, imgHeight: image.size.height)
+
+            // ---- Anti-spoof (Fase 2) ----
+            guard let liveness = self.runAntiSpoofPipeline(
+                cgImage: cgImage,
+                baseFaceRect: baseFaceRect,
+                imgWidth: image.size.width,
+                imgHeight: image.size.height,
+                config: config
+            ) else {
+                call.reject("Gagal menjalankan anti-spoof inference")
+                return
+            }
+
+            var ret: [String: Any] = [
+                "isLive": liveness.isLive,
+                "thresholdVersion": self.thresholdVersion,
+                "liveness": liveness.toJson(),
+                "quality": quality.toJson(),
+            ]
+
+            if config.debug {
+                ret["debug"] = liveness.debugToJson()
+            }
+
+            // ---- Embedding HANYA jika live, dari frame & bbox yang sama ----
+            if liveness.isLive {
+                guard let embeddings = self.extractEmbedding(cgImage: cgImage, faceRect: baseFaceRect) else {
+                    call.reject("Gagal mengekstrak embedding dari frame yang sama")
+                    return
+                }
+                ret["embedding"] = embeddings
+
+                if let ref = referenceEmbedding {
+                    guard let score = self.cosineSimilarity(ref, embeddings.map { Double($0) }) else {
+                        call.reject("referenceEmbedding tidak valid (norma nol)")
+                        return
+                    }
+                    ret["match"] = [
+                        "isMatch": score > self.matchThreshold,
+                        "score": score,
+                        "threshold": self.matchThreshold,
+                        "thresholdVersion": self.matchThresholdVersion,
+                    ]
+                }
+            }
+
+            call.resolve(ret)
+        }
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            call.reject("Gagal menjalankan Vision Request untuk verifyFace: \(error.localizedDescription)")
+        }
+    }
+
+    // ============================
+    // Active challenge (Fase 3.3, liveness-v3)
+    // ============================
+    /// Membuat challenge session (acak, single-use, expiry 60 detik).
+    /// Aplikasi menampilkan instruksi ke user, lalu memanggil verifyFaceSequence
+    /// dengan `challengeId` yang dikembalikan. Challenge TIDAK bisa dipilih dari JS.
+    @objc func createChallengeSession(_ call: CAPPluginCall) {
+        guard checkRateLimit() else {
+            call.reject("Terlalu banyak percobaan sesi liveness. Coba lagi dalam beberapa menit.", "RATE_LIMITED")
+            return
+        }
+        let session = issueChallengeSession()
+        call.resolve([
+            "challengeId": session.id,
+            "challenge": session.challenge,
+            "expiresAt": session.expiresAt.timeIntervalSince1970 * 1000,
+        ])
+    }
+
+    /// Verifikasi sesi multi-frame dengan active challenge (Fase 3.3).
+    ///
+    /// options:
+    ///   images: string[]            → ≥ 5 frame dalam ~1,5 detik
+    ///   challengeId: string         → dari createChallengeSession (single-use)
+    ///   referenceEmbedding?: number[]
+    ///   config?: GateConfig (sama dengan verifyFace)
+    ///
+    /// Aturan lulus:
+    ///   - SEMUA frame lolos quality gate
+    ///   - median liveScore ≥ liveThreshold DAN mayoritas frame isLive (voting,
+    ///     BUKAN "semua frame harus live" — lihat catatan BPCER di plan)
+    ///   - identitas konsisten antar frame sebanding (cosine ≥ identityThreshold
+    ///     terhadap frame paling frontal; frame dengan |yaw| > 20° dikecualikan)
+    ///   - challenge terpenuhi: yaw menyimpang ≥ 15° ke arah yang diminta, lalu
+    ///     minimal 2 frame kembali mendekati frontal (|yaw| < 15°)
+    ///
+    /// CATATAN KONVENSI YAW (liveness-v3): yaw ternormalisasi di sumber
+    /// (YawConvention) — positif = menoleh ke kanan anatomis user. LOOK_LEFT
+    /// butuh deviasi yaw negatif. Perangkat dengan buffer ter-flip:
+    /// set config.yawSignOverride = -1.
+    @objc func verifyFaceSequence(_ call: CAPPluginCall) {
+        guard antiSpoof27 != nil, antiSpoof40 != nil, interpreter != nil else {
+            call.reject("Model liveness atau face recognition tidak ditemukan di bundle")
+            return
+        }
+        // P2.4: jalur frame base64 dari JS = celah injeksi frame — hanya untuk
+        // build debug ATAU saat app meng-enable flag `enableInsecureFramePath`
+        // (lihat insecureFramePathAllowed). Produksi yang memungkinkan sebaiknya
+        // memakai captureLivenessSession.
+        guard insecureFramePathAllowed else {
+            call.reject("verifyFaceSequence (frame base64 dari JS) hanya untuk build debug atau app dengan flag enableInsecureFramePath — gunakan captureLivenessSession di produksi", "INSECURE_FRAME_PATH_DISABLED")
+            return
+        }
+
+        guard let images = call.getArray("images", String.self), images.count >= 2 else {
+            call.reject("images minimal berisi 2 frame (disarankan ≥ 5)")
+            return
+        }
+        // Challenge dibaca dari session native (acak, single-use, expiry) —
+        // BUKAN dari input JS. Percobaan pertama langsung mengonsumsi sesi.
+        let challengeId = call.getString("challengeId") ?? ""
+        let challenge: String
+        switch consumeChallengeSession(id: challengeId) {
+        case .ok(let session):
+            challenge = session.challenge
+        case .missing:
+            call.reject("challengeId tidak dikenal — panggil createChallengeSession dulu", "CHALLENGE_NOT_FOUND")
+            return
+        case .expired:
+            call.reject("Challenge session kedaluwarsa — buat challenge baru", "CHALLENGE_EXPIRED")
+            return
+        case .consumed:
+            call.reject("Challenge session sudah dipakai — buat challenge baru", "CHALLENGE_CONSUMED")
+            return
+        }
+
+        let config = GateConfig.from(call.getObject("config"), debugAllowed: debugAllowed)
+        let referenceEmbedding = call.getArray("referenceEmbedding", Double.self)
+
+        guard let frames = processFrames(base64Frames: images, config: config) else {
+            call.reject("Gagal memproses frame (decode / Vision)")
+            return
+        }
+
+        var result = finishSequence(frames: frames, config: config,
+                                    challenge: challenge, referenceEmbedding: referenceEmbedding)
+        result["challengeId"] = challengeId
+        result["native"] = false
+        call.resolve(result)
+    }
+
+    /// Proses frame sekuensial (VNImageRequestHandler bersifat sinkron).
+    /// Mengembalikan nil jika ada frame gagal di-decode atau Vision error.
+    private func processFrames(base64Frames: [String], config: GateConfig,
+                               timestamps: [Double]? = nil) -> [FrameResult]? {
+        var frames: [FrameResult] = []
+
+        for (index, base64) in base64Frames.enumerated() {
+            guard let image = decodeOrientedImage(base64), let cgImage = image.cgImage else {
+                print("[verifyFaceSequence] Frame \(index) gagal di-decode")
+                return nil
+            }
+
+            let request = makeFaceRectanglesRequest { [weak self] (req, error) in
+                guard let self = self else { return }
+
+                var fr = FrameResult()
+                fr.index = index
+                if let ts = timestamps, ts.indices.contains(index) {
+                    fr.timestampMs = ts[index]
+                }
+
+                if let err = error {
+                    fr.quality = QualityResult.fail(reason: "NO_FACE", faceRatio: 0, blur: 0)
+                    print("[verifyFaceSequence] Frame \(index) gagal: \(err.localizedDescription)")
+                } else {
+                    let results = req.results as? [VNFaceObservation] ?? []
+                    if results.isEmpty {
+                        fr.quality = QualityResult.fail(reason: "NO_FACE", faceRatio: 0, blur: 0)
+                    } else {
+                        fr.quality = self.runQualityGate(
+                            cgImage: cgImage, faces: results,
+                            imgWidth: image.size.width, imgHeight: image.size.height, config: config)
+                        if fr.quality.passed, let face = self.pickLargestFace(results) {
+                            let baseFaceRect = self.pixelRect(from: face, imgWidth: image.size.width, imgHeight: image.size.height)
+                            let angles = self.headAnglesDeg(face)
+                            fr.yaw = angles.yaw
+                            fr.pitch = angles.pitch
+                            fr.roll = angles.roll
+                            fr.liveness = self.runAntiSpoofPipeline(
+                                cgImage: cgImage,
+                                baseFaceRect: baseFaceRect,
+                                imgWidth: image.size.width,
+                                imgHeight: image.size.height,
+                                config: config)
+                            fr.embedding = self.extractEmbedding(cgImage: cgImage, faceRect: baseFaceRect)
+                        }
+                    }
+                }
+                frames.append(fr)
+            }
+
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+            } catch {
+                print("[verifyFaceSequence] Vision error frame \(index): \(error)")
+                return nil
+            }
+        }
+
+        return frames
+    }
+
+    /// Agregasi sesi (median + voting, konsistensi identitas, challenge).
+    /// Mengembalikan dictionary hasil — TIDAK menyelesaikan call, agar bisa
+    /// dipakai ulang oleh captureLivenessSession (Fase 4).
+    private func finishSequence(frames: [FrameResult], config: GateConfig,
+                                challenge: String, referenceEmbedding: [Double]?) -> [String: Any] {
+        var failureReason: String? = nil
+
+        // SEMUA frame harus lolos quality gate
+        for fr in frames {
+            if !fr.quality.passed {
+                failureReason = "QUALITY_FAILED"
+                break
+            }
+        }
+
+        // Referensi identitas = frame PALING FRONTAL (|yaw| terkecil), bukan frame
+        // pertama — embedding paling frontal paling stabil untuk pembanding.
+        let refFrame: FrameResult? = failureReason == nil
+            ? frames.filter { $0.embedding != nil }.min(by: { abs($0.yaw) < abs($1.yaw) })
+            : nil
+        let refEmbedding = refFrame?.embedding
+
+        // Konsistensi identitas: hanya bandingkan frame "sebanding" (|yaw| <=
+        // identityMaxPose). Frame dengan pose berat tugasnya membuktikan challenge;
+        // embedding-nya tidak pose-invariant dan tidak boleh mematikan sesi.
+        var identityConsistent = true
+        var minIdentityCosine: Double? = nil
+        if failureReason == nil, let ref = refEmbedding, let refIndex = refFrame?.index {
+            var comparableCosines: [Double] = []
+            for fr in frames {
+                guard let embedding = fr.embedding, fr.index != refIndex else { continue }
+                guard abs(fr.yaw) <= identityMaxPose else { continue }
+                if let cos = cosineSimilarity(ref.map { Double($0) }, embedding.map { Double($0) }) {
+                    comparableCosines.append(cos)
+                    if minIdentityCosine == nil || cos < minIdentityCosine! {
+                        minIdentityCosine = cos
+                    }
+                }
+            }
+            if !comparableCosines.isEmpty {
+                let avg = comparableCosines.reduce(0, +) / Double(comparableCosines.count)
+                let minCos = minIdentityCosine ?? 1.0
+                if minCos < 0.55 || avg < config.identityThreshold {
+                    identityConsistent = false
+                }
+            }
+        }
+
+        // ---- Agregasi (median + voting, BUKAN all-live) ----
+        let liveScores: [Float] = frames.map { $0.liveness?.liveScore ?? 0 }
+        let liveVotes = frames.filter { $0.liveness?.isLive == true }.count
+        // Yaw sudah ternormalisasi di sumber (YawConvention): positif = menoleh
+        // ke kanan anatomis user. yawSignOverride hanya untuk perangkat dengan
+        // buffer kamera ter-flip — diterapkan SEBELUM agregasi.
+        let yawSamples = frames.filter { $0.quality.passed }
+            .map {
+                ChallengeTrajectory.Sample(
+                    yaw: YawConvention.applyOverride($0.yaw, overrideSign: config.yawSignOverride),
+                    timestampMs: $0.timestampMs)
+            }
+        let yawValues = yawSamples.map { $0.yaw }
+        let maxYaw = yawValues.max() ?? 0
+        let minYaw = yawValues.min() ?? 0
+        let frontalFrames = yawValues.filter { abs($0) < challengeFrontMax }.count
+
+        let medianLiveScore = median(liveScores)
+        // P2.1: voting sesi diperketat — default SEMUA frame harus isLive.
+        let requiredVotes = Int(ceil(Double(frames.count) * Double(config.minLiveVoteRatio)))
+
+        // Challenge (P1): verifikasi LINTASAN TEMPORAL, bukan min/max agregat —
+        // frontal di awal → deviasi ≥ 15° ke arah challenge → kembali frontal,
+        // tanpa gerakan dua arah (head-shake), dengan gerakan halus.
+        // Lihat ChallengeTrajectory untuk aturan R1–R5.
+        let trajectory = ChallengeTrajectory.evaluate(samples: yawSamples, challenge: challenge)
+        let challengeSatisfied = trajectory.passed
+
+        // ---- Anti-replay (P2) ----
+        // P2.1: veto per-frame — satu frame dengan label spoof (PRINT/REPLAY)
+        // atau spoofScore >= spoofHardVeto langsung menggagalkan sesi,
+        // TANPA toleransi voting.
+        var spoofFrameDetected = false
+        var maxScreenSuspect: Float = 0
+        for fr in frames {
+            guard let live = fr.liveness else { continue }
+            if live.label != "LIVE" || live.spoofScore >= spoofHardVeto {
+                spoofFrameDetected = true
+            }
+            maxScreenSuspect = max(maxScreenSuspect, live.screenSuspectScore)
+        }
+        // P2.2: veto screen-suspect hanya jika di-set eksplisit (mode ketat opt-in);
+        // default hanya dicatat sebagai soft signal untuk pengumpulan data.
+        let screenVetoTriggered = config.screenSuspectVeto.map { maxScreenSuspect >= $0 } ?? false
+        // P2.3: durasi sesi harus masuk rentang gerakan manusia
+        // (hanya diperiksa jika timestamp diketahui — jalur native capture).
+        let timingOk = trajectory.durationMs <= 0
+            || (trajectory.durationMs >= sessionDurationMinMs
+                && trajectory.durationMs <= sessionDurationMaxMs)
+
+        let passed = failureReason == nil
+            && !spoofFrameDetected
+            && !screenVetoTriggered
+            && timingOk
+            && medianLiveScore >= config.liveThreshold
+            && liveVotes >= requiredVotes
+            && identityConsistent
+            && challengeSatisfied
+
+        var ret = buildSequenceResult(
+            passed: passed, reason: nil, challenge: challenge,
+            medianLiveScore: medianLiveScore, liveVotes: liveVotes, frameCount: frames.count,
+            maxYaw: maxYaw, minYaw: minYaw, frontalFrames: frontalFrames,
+            identityConsistent: identityConsistent, minIdentityCosine: minIdentityCosine,
+            trajectory: trajectory.toJson(), maxScreenSuspect: maxScreenSuspect)
+        if config.debug {
+            ret["yawTrace"] = frames.map { fr -> [String: Any] in
+                var entry: [String: Any] = [
+                    "index": fr.index,
+                    "yaw": YawConvention.applyOverride(fr.yaw, overrideSign: config.yawSignOverride),
+                ]
+                if let ts = fr.timestampMs { entry["timestampMs"] = ts }
+                return entry
+            }
+        }
+
+        if passed, let ref = referenceEmbedding, let best = refEmbedding {
+            if let score = cosineSimilarity(ref, best.map { Double($0) }) {
+                ret["match"] = [
+                    "isMatch": score > matchThreshold,
+                    "score": score,
+                    "threshold": matchThreshold,
+                    "thresholdVersion": matchThresholdVersion,
+                ]
+            }
+        }
+
+        if !passed {
+            var reason = failureReason
+            if reason == nil {
+                // Prioritas alasan gagal: spoof > screen > timing > challenge > votes > identitas
+                if spoofFrameDetected {
+                    reason = "SPOOF_FRAME_DETECTED"
+                } else if screenVetoTriggered {
+                    reason = "SCREEN_SUSPECTED"
+                } else if !timingOk {
+                    reason = "TIMING_SUSPECT"
+                } else if !challengeSatisfied {
+                    reason = trajectory.failureReason ?? "CHALLENGE_FAILED"
+                } else if liveVotes < requiredVotes || medianLiveScore < config.liveThreshold {
+                    reason = "NOT_LIVE_ENOUGH"
+                } else if !identityConsistent {
+                    reason = "IDENTITY_INCONSISTENT"
+                }
+            }
+            ret["reason"] = reason ?? "UNKNOWN"
+        }
+
+        return ret
+    }
+
+    private func buildSequenceResult(passed: Bool, reason: String?, challenge: String,
+                                     medianLiveScore: Float, liveVotes: Int, frameCount: Int,
+                                     maxYaw: Float, minYaw: Float, frontalFrames: Int,
+                                     identityConsistent: Bool,
+                                     minIdentityCosine: Double?,
+                                     trajectory: [String: Any],
+                                     maxScreenSuspect: Float) -> [String: Any] {
+        var ret: [String: Any] = [
+            "passed": passed,
+            "challenge": challenge,
+            "medianLiveScore": medianLiveScore,
+            "liveVotes": liveVotes,
+            "frameCount": frameCount,
+            "maxYaw": maxYaw,
+            "minYaw": minYaw,
+            "frontalFrames": frontalFrames,
+            "identityConsistent": identityConsistent,
+            // Diagnostik kalibrasi: cosine minimum antar frame sebanding (null jika < 2)
+            "minIdentityCosine": minIdentityCosine ?? NSNull(),
+            // Ringkasan lintasan challenge (P1): R1–R5 + statistik yaw
+            "trajectory": trajectory,
+            // Sinyal artefak layar agregat (P2.2) — soft signal kecuali screenSuspectVeto di-set
+            "screenSuspect": maxScreenSuspect,
+            "thresholdVersion": thresholdVersion,
+        ]
+        if let reason = reason {
+            ret["reason"] = reason
+        }
+        return ret
+    }
+
+    // ============================
+    // Native capture (Fase 4) — captureLivenessSession
+    // ============================
+    /// Sesi liveness native (anti injeksi frame): kamera dibuka oleh view controller
+    /// plugin, frame diambil dan disimpan ke file privat TANPA melewati JS, lalu
+    /// pipeline verifikasi (quality gate + liveness + challenge) dijalankan terhadap
+    /// frame tersebut. Yang kembali ke JS hanya HASIL — bukan frame mentah.
+    ///
+    /// options:
+    ///   referenceEmbedding?: number[]
+    ///   config?: LivenessConfig
+    ///
+    /// Challenge SELALU dibuat internal (acak) — caller tidak bisa memilih arah.
+    /// Response = VerifyFaceSequenceResult + { native, deviceIntegrity, auditId }
+    @objc func captureLivenessSession(_ call: CAPPluginCall) {
+        guard antiSpoof27 != nil, antiSpoof40 != nil, interpreter != nil else {
+            call.reject("Model liveness atau face recognition tidak ditemukan di bundle")
+            return
+        }
+        guard checkRateLimit() else {
+            call.reject("Terlalu banyak percobaan sesi liveness. Coba lagi dalam beberapa menit.", "RATE_LIMITED")
+            return
+        }
+
+        // Challenge SELALU acak dari native — menutup brute-force
+        // "ulangi sesi sampai challenge cocok dengan video yang disiapkan".
+        let challenge = Int.random(in: 0...1) == 0 ? "LOOK_LEFT" : "LOOK_RIGHT"
+
+        let config = GateConfig.from(call.getObject("config"), debugAllowed: debugAllowed)
+        let referenceEmbedding = call.getArray("referenceEmbedding", Double.self)
+
+        AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard granted else {
+                    call.reject("Izin kamera ditolak")
+                    return
+                }
+                guard let presenter = self.bridge?.viewController else {
+                    call.reject("ViewController tidak tersedia untuk membuka kamera")
+                    return
+                }
+
+                let captureVC = LivenessCaptureViewController(
+                    challenge: challenge, frameCount: 12, interval: 0.12, warmup: 1.2
+                ) { [weak self] result in
+                    guard let self = self else { return }
+                    switch result {
+                    case .failure(let error):
+                        call.reject("Capture gagal: \(error.localizedDescription)")
+                    case .success(let frames):
+                        self.processCapturedSession(
+                            call: call, frames: frames, challenge: challenge,
+                            config: config, referenceEmbedding: referenceEmbedding)
+                    }
+                }
+                captureVC.modalPresentationStyle = .fullScreen
+                presenter.present(captureVC, animated: true)
+            }
+        }
+    }
+
+    /// Verifikasi frame hasil native capture + jejak audit terenkripsi.
+    private func processCapturedSession(call: CAPPluginCall,
+                                        frames capturedFrames: [LivenessCaptureViewController.CapturedFrame],
+                                        challenge: String,
+                                        config: GateConfig, referenceEmbedding: [Double]?) {
+        var base64Frames: [String] = []
+        var frameBytes: [Data] = []
+        var timestamps: [Double] = []
+        for frame in capturedFrames {
+            guard let data = try? Data(contentsOf: frame.url) else {
+                call.reject("Gagal membaca frame capture")
+                return
+            }
+            frameBytes.append(data)
+            base64Frames.append(data.base64EncodedString())
+            timestamps.append(frame.timestampMs)
+            // Frame sementara dihapus — salinan terenkripsi disimpan oleh AuditStore
+            try? FileManager.default.removeItem(at: frame.url)
+        }
+
+        guard let frames = processFrames(base64Frames: base64Frames, config: config,
+                                         timestamps: timestamps) else {
+            call.reject("Gagal memproses frame capture (decode / Vision)")
+            return
+        }
+
+        var ret = finishSequence(frames: frames, config: config,
+                                 challenge: challenge, referenceEmbedding: referenceEmbedding)
+        ret["native"] = true
+        ret["deviceIntegrity"] = DeviceIntegrity.snapshot()
+
+        if let json = try? JSONSerialization.data(withJSONObject: ret, options: [.sortedKeys]) {
+            do {
+                ret["auditId"] = try AuditStore.storeSession(json: json, frames: frameBytes)
+            } catch {
+                print("[FaceRecognition] Audit store gagal: \(error)")
+                ret["auditId"] = NSNull()
+            }
+        }
+
+        call.resolve(ret)
+    }
+
+    // ============================
+    // Device integrity (Fase 4) — sinyal risiko, bukan bukti
+    // ============================
+    @objc func getDeviceIntegrity(_ call: CAPPluginCall) {
+        call.resolve(["deviceIntegrity": DeviceIntegrity.snapshot()])
+    }
+
+    // ============================
+    // Quality Gate (Fase 3.1)
+    // ============================
+    private func runQualityGate(cgImage: CGImage, faces: [VNFaceObservation],
+                                imgWidth: CGFloat, imgHeight: CGFloat,
+                                config: GateConfig) -> QualityResult {
+        guard let largest = pickLargestFace(faces) else {
+            return QualityResult.fail(reason: "NO_FACE", faceRatio: 0, blur: 0)
+        }
+
+        // MULTIPLE_FACES: tolak jika ada > 1 wajah yang cukup besar
+        let largestArea = max(0.0001, largest.boundingBox.width * largest.boundingBox.height)
+        var significantFaces = 0
+        for f in faces {
+            let area = f.boundingBox.width * f.boundingBox.height
+            if area >= largestArea * 0.3 { significantFaces += 1 }
+        }
+        if significantFaces > 1 {
+            return QualityResult.fail(reason: "MULTIPLE_FACES", faceRatio: 0, blur: 0)
+        }
+
+        // LOW_RESOLUTION
+        if min(imgWidth, imgHeight) < CGFloat(config.minFrameSide) {
+            return QualityResult.fail(reason: "LOW_RESOLUTION", faceRatio: 0, blur: 0)
+        }
+
+        // FACE_TOO_SMALL
+        let faceRect = pixelRect(from: largest, imgWidth: imgWidth, imgHeight: imgHeight)
+        let faceRatio = Float(faceRect.width / imgWidth)
+        if faceRatio < config.minFaceRatio {
+            return QualityResult.fail(reason: "FACE_TOO_SMALL", faceRatio: faceRatio, blur: 0)
+        }
+
+        // FACE_AT_EDGE: bbox menyentuh tepi frame (margin 5%)
+        let marginX = imgWidth * CGFloat(config.edgeMargin)
+        let marginY = imgHeight * CGFloat(config.edgeMargin)
+        if faceRect.minX <= marginX || faceRect.minY <= marginY
+                || faceRect.maxX >= imgWidth - marginX || faceRect.maxY >= imgHeight - marginY {
+            return QualityResult.fail(reason: "FACE_AT_EDGE", faceRatio: faceRatio, blur: 0)
+        }
+
+        // BAD_POSE
+        let angles = headAnglesDeg(largest)
+        if abs(angles.yaw) > config.maxPose || abs(angles.pitch) > config.maxPose
+                || abs(angles.roll) > config.maxPose {
+            return QualityResult.fail(reason: "BAD_POSE", faceRatio: faceRatio, blur: 0)
+        }
+
+        // BLURRY + BAD_LIGHTING dari crop wajah
+        guard let faceCrop = cgImage.cropping(to: faceRect) else {
+            return QualityResult.fail(reason: "BLURRY", faceRatio: faceRatio, blur: 0)
+        }
+        let blur = varianceOfLaplacian(faceCrop)
+        let exposure = meanLuminance(faceCrop)
+        if blur < config.blurMin {
+            return QualityResult.fail(reason: "BLURRY", faceRatio: faceRatio, blur: blur)
+        }
+        if exposure < config.exposureMin || exposure > config.exposureMax {
+            return QualityResult.fail(reason: "BAD_LIGHTING", faceRatio: faceRatio, blur: blur)
+        }
+
+        return QualityResult.pass(faceRatio: faceRatio, blur: blur)
+    }
+
+    // ============================
+    // Anti-Spoof Pipeline (Fase 2) — port referensi Silent-Face
+    // ============================
+    private struct AntiSpoofResult {
+        var label: String
+        var liveScore: Float
+        var printScore: Float
+        var replayScore: Float
+        var spoofScore: Float
+        var isLive: Bool
+        var probs27: [Float]
+        var probs40: [Float]
+        /// Sinyal artefak layar per frame (P2.2) — soft signal, lihat ScreenSuspect.
+        var screenSuspectScore: Float = 0
+
+        func toJson() -> [String: Any] {
+            return [
+                "label": label,
+                "liveScore": liveScore,
+                "printScore": printScore,
+                "replayScore": replayScore,
+                "screenSuspectScore": screenSuspectScore,
+            ]
+        }
+
+        func debugToJson() -> [String: Any] {
+            return [
+                "probs27": probs27.map { Double($0) },
+                "probs40": probs40.map { Double($0) },
+            ]
+        }
+    }
+
+    /// Pipeline referensi:
+    ///   crop 2.7x (shift) → model 2.7 ─┐
+    ///                                    ├→ sum softmax → argmax + veto → keputusan
+    ///   crop 4.0x (shift) → model 4.0 ─┘
+    private func runAntiSpoofPipeline(
+        cgImage: CGImage,
+        baseFaceRect: CGRect,
+        imgWidth: CGFloat,
+        imgHeight: CGFloat,
+        config: GateConfig? = nil
+    ) -> AntiSpoofResult? {
+        guard let interp27 = antiSpoof27, let interp40 = antiSpoof40 else { return nil }
+        let cfg = config ?? GateConfig.from(nil)
+
+        guard let logits27 = runAntiSpoofModel(
+                interpreter: interp27, lock: antiSpoof27Lock, cgImage: cgImage,
+                baseFaceRect: baseFaceRect, cropScale: cropScale27,
+                imgWidth: imgWidth, imgHeight: imgHeight),
+              let logits40 = runAntiSpoofModel(
+                interpreter: interp40, lock: antiSpoof40Lock, cgImage: cgImage,
+                baseFaceRect: baseFaceRect, cropScale: cropScale40,
+                imgWidth: imgWidth, imgHeight: imgHeight)
+        else {
+            return nil
+        }
+
+        let probs27 = softmax(logits27)
+        let probs40 = softmax(logits40)
+
+        // p = softmax(out27) + softmax(out40) → rentang 0..2
+        var p = [Float](repeating: 0, count: antiSpoofOutputSize)
+        for i in 0..<antiSpoofOutputSize {
+            p[i] = probs27[i] + probs40[i]
+        }
+
+        // argmax 3 kelas: [print, live, replay]
+        var argmax = 0
+        for i in 1..<p.count where p[i] > p[argmax] {
+            argmax = i
+        }
+
+        var result = AntiSpoofResult(
+            label: argmax == 1 ? "LIVE" : (argmax == 0 ? "PRINT" : "REPLAY"),
+            liveScore: p[1] / 2,
+            printScore: p[0] / 2,
+            replayScore: p[2] / 2,
+            spoofScore: max(p[0], p[2]) / 2,
+            isLive: false,
+            probs27: probs27,
+            probs40: probs40
+        )
+        result.isLive = argmax == 1
+            && result.liveScore >= cfg.liveThreshold
+            && result.spoofScore < cfg.spoofVeto
+        // Sinyal artefak layar per frame (P2.2) — soft signal untuk audit/tuning
+        result.screenSuspectScore = analyzeScreenSuspect(cgImage: cgImage, baseFaceRect: baseFaceRect)
+        return result
+    }
+
+    /// Downsample crop wajah ke 32x32 lalu analisis artefak layar (P2.2).
+    private func analyzeScreenSuspect(cgImage: CGImage, baseFaceRect: CGRect) -> Float {
+        let size = 32
+        let imageBounds = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+        let clamped = baseFaceRect.integral.intersection(imageBounds)
+        guard !clamped.isEmpty, let crop = cgImage.cropping(to: clamped) else { return 0 }
+
+        var rawPixels = [UInt8](repeating: 0, count: size * size * 4)
+        guard let context = CGContext(
+            data: &rawPixels, width: size, height: size, bitsPerComponent: 8,
+            bytesPerRow: size * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return 0 }
+        context.interpolationQuality = .low
+        context.draw(crop, in: CGRect(x: 0, y: 0, width: size, height: size))
+
+        var argb = [UInt32](repeating: 0, count: size * size)
+        for i in 0..<(size * size) {
+            let r = UInt32(rawPixels[i * 4])
+            let g = UInt32(rawPixels[i * 4 + 1])
+            let b = UInt32(rawPixels[i * 4 + 2])
+            argb[i] = (r << 16) | (g << 8) | b
+        }
+        return ScreenSuspect.analyze(argb: argb, width: size, height: size).score
+    }
+
     /// Menjalankan satu inferensi anti-spoofing untuk satu scale tertentu.
     ///
     /// - Parameters:
@@ -503,7 +1571,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     ///                  2.7 = crop lebar (sesuai paper MiniFASNet, tangkap artefak layar/foto)
     ///   - imgWidth / imgHeight: Dimensi gambar asli
     /// - Returns: Skor liveness (0.0 = spoof, 1.0 = live), nil jika gagal
-    private func runAntiSpoofInference(
+    private func runAntiSpoofInferenceLegacy(
         interpreter: Interpreter,
         image: UIImage,
         cgImage: CGImage,
@@ -571,6 +1639,278 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Menjalankan satu inferensi anti-spoofing untuk satu model dengan crop scale-nya.
+    /// Interpreter TFLite TIDAK thread-safe → akses disinkronkan per model.
+    ///
+    /// - Returns: raw logits (3 kelas), atau nil jika gagal
+    private func runAntiSpoofModel(
+        interpreter: Interpreter,
+        lock: NSLock,
+        cgImage: CGImage,
+        baseFaceRect: CGRect,
+        cropScale: CGFloat,
+        imgWidth: CGFloat,
+        imgHeight: CGFloat
+    ) -> [Float]? {
+        // Crop sesuai referensi (_get_new_box): scale diturunkan jika tidak muat,
+        // w & h terpisah, SHIFT bukan clip, tanpa square-ifikasi
+        let faceRect = getNewBox(baseFaceRect, cropScale: cropScale, imgWidth: imgWidth, imgHeight: imgHeight)
+
+        guard let croppedCgImage = cgImage.cropping(to: faceRect) else { return nil }
+
+        // Resize ke 80x80
+        let targetSize = CGSize(width: antiSpoofInputSize, height: antiSpoofInputSize)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let scaledImage = renderer.image { _ in
+            UIImage(cgImage: croppedCgImage).draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+
+        guard let inputData = imageToInputDataAntiSpoof(scaledImage, size: antiSpoofInputSize) else {
+            return nil
+        }
+
+        do {
+            lock.lock()
+            defer { lock.unlock() }
+            try interpreter.copy(inputData, toInputAt: 0)
+            try interpreter.invoke()
+
+            let outputTensor = try interpreter.output(at: 0)
+            let outputData = outputTensor.data
+
+            var scores = [Float](repeating: 0, count: antiSpoofOutputSize)
+            _ = scores.withUnsafeMutableBytes { ptr in
+                outputData.copyBytes(to: ptr)
+            }
+
+            // Model mengeluarkan raw logits — softmax dilakukan di pemanggil
+            return scores
+        } catch {
+            print("[AntiSpoof] Inference error (scale \(cropScale)): \(error)")
+            return nil
+        }
+    }
+
+    /// Port logika crop referensi (_get_new_box):
+    ///   scale diturunkan jika crop tidak muat di gambar,
+    ///   lebar dan tinggi diskalakan TERPISAH (tanpa square),
+    ///   jika keluar batas maka DIGESER (shift), bukan dipotong (clip).
+    private func getNewBox(_ bounds: CGRect, cropScale: CGFloat,
+                           imgWidth: CGFloat, imgHeight: CGFloat) -> CGRect {
+        let boxW = bounds.width
+        let boxH = bounds.height
+        let cx = bounds.midX
+        let cy = bounds.midY
+
+        // Turunkan scale jika crop tidak muat
+        let maxScaleW = (imgWidth - 1) / boxW
+        let maxScaleH = (imgHeight - 1) / boxH
+        let s = min(cropScale, min(maxScaleW, maxScaleH))
+
+        let newW = boxW * s
+        let newH = boxH * s
+
+        var left = cx - newW / 2
+        var top = cy - newH / 2
+        var right = left + newW
+        var bottom = top + newH
+
+        // SHIFT, bukan clip
+        if left < 0 { right -= left; left = 0 }
+        if top < 0 { bottom -= top; top = 0 }
+        if right > imgWidth - 1 { left -= (right - (imgWidth - 1)); right = imgWidth - 1 }
+        if bottom > imgHeight - 1 { top -= (bottom - (imgHeight - 1)); bottom = imgHeight - 1 }
+
+        // Penjagaan akhir untuk kasus ekstrem
+        left = max(0, left)
+        top = max(0, top)
+
+        let x = (left).rounded()
+        let y = (top).rounded()
+        let w = max(1, min(imgWidth - x, (right - left).rounded()))
+        let h = max(1, min(imgHeight - y, (bottom - top).rounded()))
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    // ============================
+    // Face Recognition helpers
+    // ============================
+
+    /// Ekstrak embedding MobileFaceNet dari frame dan bbox yang diberikan.
+    /// Crop memakai logika yang SAMA dengan pipeline enrollment (bbox langsung,
+    /// di-clip ke batas gambar) agar embedding enroll dan verify konsisten.
+    private func extractEmbedding(cgImage: CGImage, faceRect: CGRect) -> [Float]? {
+        guard let interpreter = interpreter else { return nil }
+
+        let clamped = faceRect.intersection(CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+        guard !clamped.isNull, clamped.width > 0, clamped.height > 0,
+              let croppedCgImage = cgImage.cropping(to: clamped) else { return nil }
+
+        let targetSize = CGSize(width: inputSize, height: inputSize)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let scaledImage = renderer.image { _ in
+            UIImage(cgImage: croppedCgImage).draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+
+        guard let inputData = imageToInputData(scaledImage, size: inputSize) else { return nil }
+
+        do {
+            embeddingLock.lock()
+            defer { embeddingLock.unlock() }
+            try interpreter.copy(inputData, toInputAt: 0)
+            try interpreter.invoke()
+
+            let outputTensor = try interpreter.output(at: 0)
+            let outputData = outputTensor.data
+
+            var embeddings = [Float](repeating: 0, count: outputData.count / MemoryLayout<Float>.size)
+            _ = embeddings.withUnsafeMutableBytes { ptr in
+                outputData.copyBytes(to: ptr)
+            }
+            return embeddings
+        } catch {
+            print("[FaceRecognition] extractEmbedding error: \(error)")
+            return nil
+        }
+    }
+
+    private func pickLargestFace(_ faces: [VNFaceObservation]) -> VNFaceObservation? {
+        return faces.max { a, b in
+            (a.boundingBox.width * a.boundingBox.height) < (b.boundingBox.width * b.boundingBox.height)
+        }
+    }
+
+    /// Konversi bounding box Vision (kiri-bawah, normalized) → piksel (kiri-atas)
+    private func pixelRect(from face: VNFaceObservation,
+                           imgWidth: CGFloat, imgHeight: CGFloat) -> CGRect {
+        let bb = face.boundingBox
+        return CGRect(
+            x: bb.origin.x * imgWidth,
+            y: (1 - bb.origin.y - bb.size.height) * imgHeight,
+            width: bb.size.width * imgWidth,
+            height: bb.size.height * imgHeight
+        )
+    }
+
+    /// Head angles dari VNFaceObservation (radian) → derajat.
+    // ============================
+    // Vision request factory
+    // ============================
+    /// Pin revision 3 (iOS 15+). CATATAN PENTING: revision ≤2 mengembalikan
+    /// yaw/roll DISKRIT (bin ±45°) dan pitch selalu nil — mematikan akurasi
+    /// challenge 15°. Revision 3 memberi nilai kontinu + pitch (perilaku ini
+    /// dikonfirmasi Apple via DTS; lihat juga tutorial Vision iOS 15).
+    private func makeFaceRectanglesRequest(
+        completionHandler: @escaping VNRequestCompletionHandler
+    ) -> VNDetectFaceRectanglesRequest {
+        let request = VNDetectFaceRectanglesRequest(completionHandler: completionHandler)
+        request.revision = VNDetectFaceRectanglesRequestRevision3
+        return request
+    }
+
+    /// Konvensi sama dengan ML Kit Android: X = pitch, Y = yaw, Z = roll.
+    /// Yaw TERNORMALISASI (YawConvention, liveness-v3): hasil POSITIF = user
+    /// menoleh ke kanan anatomisnya — sudah dikoreksi dari yaw mentah Vision.
+    private func headAnglesDeg(_ face: VNFaceObservation) -> (pitch: Float, yaw: Float, roll: Float) {
+        let rad2deg = Float(180.0 / .pi)
+        let pitch = face.pitch.map { Float(truncating: $0) } ?? 0
+        let yaw = YawConvention.normalize(rawYaw: face.yaw.map { Float(truncating: $0) } ?? 0)
+        let roll = face.roll.map { Float(truncating: $0) } ?? 0
+        return (pitch: pitch * rad2deg, yaw: yaw * rad2deg, roll: roll * rad2deg)
+    }
+
+    private func cosineSimilarity(_ a: [Double], _ b: [Double]) -> Double? {
+        guard a.count == b.count, !a.isEmpty else { return nil }
+        var dot = 0.0, norm1 = 0.0, norm2 = 0.0
+        for i in 0..<a.count {
+            dot += a[i] * b[i]
+            norm1 += a[i] * a[i]
+            norm2 += b[i] * b[i]
+        }
+        guard norm1 > 0, norm2 > 0 else { return nil }
+        return dot / (sqrt(norm1) * sqrt(norm2))
+    }
+
+    // ============================
+    // Quality gate helpers — blur, exposure
+    // ============================
+
+    /// Variance of Laplacian pada grayscale — ukuran blur (semakin tinggi semakin tajam).
+    private func varianceOfLaplacian(_ cgImage: CGImage) -> Float {
+        let size = 160 // ukuran kerja tetap agar skor konsisten antar frame
+        guard let gray = grayscalePixels(cgImage, size: size) else { return 0 }
+
+        // Kernel Laplacian 3x3: [0 1 0; 1 -4 1; 0 1 0]
+        var sum: Double = 0, sumSq: Double = 0
+        var count = 0
+        for y in 1..<(size - 1) {
+            for x in 1..<(size - 1) {
+                let idx = y * size + x
+                let lap = Double(gray[idx - size]) + Double(gray[idx + size])
+                        + Double(gray[idx - 1]) + Double(gray[idx + 1])
+                        - 4 * Double(gray[idx])
+                sum += lap
+                sumSq += lap * lap
+                count += 1
+            }
+        }
+        guard count > 0 else { return 0 }
+        let mean = sum / Double(count)
+        return Float(sumSq / Double(count) - mean * mean)
+    }
+
+    /// Mean luminance crop wajah (0..255) — untuk gate exposure.
+    private func meanLuminance(_ cgImage: CGImage) -> Float {
+        let size = 64
+        guard let gray = grayscalePixels(cgImage, size: size) else { return 0 }
+        let sum = gray.reduce(0.0) { $0 + Double($1) }
+        return Float(sum / Double(gray.count))
+    }
+
+    /// Render CGImage ke grayscale (8-bit) berukuran size x size.
+    private func grayscalePixels(_ cgImage: CGImage, size: Int) -> [UInt8]? {
+        var pixels = [UInt8](repeating: 0, count: size * size)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.linearGray),
+              let context = CGContext(
+                  data: &pixels,
+                  width: size,
+                  height: size,
+                  bitsPerComponent: 8,
+                  bytesPerRow: size,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.none.rawValue
+              )
+        else { return nil }
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: size, height: size))
+        return pixels
+    }
+
+    // ============================
+    // Image / preprocessing helpers
+    // ============================
+
+    /// Decode Base64 → UIImage dengan orientasi sudah dinormalisasi (EXIF/UIImage.orientation).
+    private func decodeOrientedImage(_ imageBase64: String) -> UIImage? {
+        guard let data = Data(base64Encoded: imageBase64, options: .ignoreUnknownCharacters),
+              let image = UIImage(data: data)
+        else {
+            return nil
+        }
+        guard image.imageOrientation != .up else { return image }
+
+        // Render ulang agar piksel benar-benar tersetel orientasinya
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = image.scale
+        let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: image.size))
+        }
+    }
+
     // ============================
     // Helper: UIImage → ByteData TFLite — Face Recognition (MobileFaceNet)
     // Normalisasi ke [-1, 1]
@@ -624,7 +1964,7 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // ============================
-    // Helper: UIImage → ByteData TFLite — Anti-Spoofing (MiniFASNet)
+    // Helper: UIImage → ByteData TFLite — Anti-Spoofing (Silent-Face)
     // ============================
     private func imageToInputDataAntiSpoof(_ image: UIImage, size: Int) -> Data? {
         guard let cgImage = image.cgImage else { return nil }
@@ -651,9 +1991,8 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
 
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
 
-        // Model TFLite ini diexport dengan preprocessing bawaan (kemungkinan normalization node ada di dalam graf)
-        // sehingga model mengekspektasikan nilai piksel raw [0, 255].
-        // Format yang diminta: B, G, R
+        // Model Silent-Face mengekspektasikan nilai piksel raw [0, 255] dalam urutan BGR
+        // (normalisasi ada di dalam graf model). Jangan paksa ke [-1, 1].
         var floatBuffer = [Float](repeating: 0, count: width * height * 3)
         var floatIndex = 0
 
@@ -680,5 +2019,107 @@ public class FaceRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
         let exps = logits.map { exp($0 - maxVal) }
         let sumExps = exps.reduce(0, +)
         return exps.map { $0 / sumExps }
+    }
+
+    private func median(_ values: [Float]) -> Float {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        if sorted.count % 2 == 1 { return sorted[mid] }
+        return (sorted[mid - 1] + sorted[mid]) / 2
+    }
+
+    // ============================
+    // Konfigurasi quality gate yang bisa di-override per panggilan
+    // ============================
+    private struct GateConfig {
+        var liveThreshold: Float = 0.80
+        var spoofVeto: Float = 0.20
+        var minFrameSide: Int = 480
+        var minFaceRatio: Float = 0.25
+        var edgeMargin: Float = 0.05
+        var maxPose: Float = 20
+        var blurMin: Float = 50
+        var exposureMin: Float = 60
+        var exposureMax: Float = 200
+        var identityThreshold: Double = 0.70
+        /// Override tanda yaw per-perangkat (1 atau -1) untuk kasus buffer
+        /// kamera ter-flip (mis. beberapa Samsung/OnePlus). Default 1 —
+        /// konvensi normal sudah ditangani YawConvention di sumber pengukuran.
+        var yawSignOverride: Int = 1
+        /// Rasio minimum frame yang harus isLive per sesi (P2.1). Default 1.0 =
+        /// SEMUA frame harus isLive (paling ketat). Jika pengukuran BPCER di
+        /// example-app menunjukkan user asli sering gagal, turunkan (mis. 0.8) —
+        /// veto per-frame SPOOF_FRAME_DETECTED tetap melindungi anti-replay.
+        var minLiveVoteRatio: Float = 1.0
+        /// Veto screen-suspect per sesi (P2.2) — nil = soft signal saja (default).
+        var screenSuspectVeto: Float? = nil
+        var debug: Bool = false
+
+        static func from(_ config: JSObject?) -> GateConfig {
+            return from(config, debugAllowed: false)
+        }
+
+        /// - Parameter debugAllowed: hanya true pada build DEBUG — output debug
+        ///   tidak pernah dikembalikan dari build rilis (Fase 4)
+        static func from(_ config: JSObject?, debugAllowed: Bool) -> GateConfig {
+            var c = GateConfig()
+            c.debug = false
+            guard let config = config else { return c }
+            if let v = config["liveThreshold"] as? Double { c.liveThreshold = Float(v) }
+            if let v = config["spoofVeto"] as? Double { c.spoofVeto = Float(v) }
+            if let v = config["minFrameSide"] as? Int { c.minFrameSide = v }
+            if let v = config["minFaceRatio"] as? Double { c.minFaceRatio = Float(v) }
+            if let v = config["edgeMargin"] as? Double { c.edgeMargin = Float(v) }
+            if let v = config["maxPose"] as? Double { c.maxPose = Float(v) }
+            if let v = config["blurMin"] as? Double { c.blurMin = Float(v) }
+            if let v = config["exposureMin"] as? Double { c.exposureMin = Float(v) }
+            if let v = config["exposureMax"] as? Double { c.exposureMax = Float(v) }
+            if let v = config["identityThreshold"] as? Double { c.identityThreshold = v }
+            if let v = config["yawSignOverride"] as? Int { c.yawSignOverride = v }
+            if let v = config["minLiveVoteRatio"] as? Double { c.minLiveVoteRatio = Float(v) }
+            if let v = config["screenSuspectVeto"] as? Double { c.screenSuspectVeto = Float(v) }
+            if let v = config["debug"] as? Bool { c.debug = v && debugAllowed }
+            return c
+        }
+    }
+
+    private struct QualityResult {
+        var passed: Bool
+        var reason: String?
+        var faceRatio: Float
+        var blur: Float
+
+        static func pass(faceRatio: Float, blur: Float) -> QualityResult {
+            return QualityResult(passed: true, reason: nil, faceRatio: faceRatio, blur: blur)
+        }
+
+        static func fail(reason: String, faceRatio: Float, blur: Float) -> QualityResult {
+            return QualityResult(passed: false, reason: reason, faceRatio: faceRatio, blur: blur)
+        }
+
+        func toJson() -> [String: Any] {
+            var o: [String: Any] = [
+                "passed": passed,
+                "faceRatio": faceRatio,
+                "blur": blur,
+            ]
+            if let reason = reason {
+                o["reason"] = reason
+            }
+            return o
+        }
+    }
+
+    private struct FrameResult {
+        var index: Int = 0
+        var yaw: Float = 0
+        var pitch: Float = 0
+        var roll: Float = 0
+        /// Epoch ms saat frame di-capture (native capture) — nil untuk jalur JS base64.
+        var timestampMs: Double? = nil
+        var quality: QualityResult = QualityResult.fail(reason: "NO_FACE", faceRatio: 0, blur: 0)
+        var liveness: AntiSpoofResult?
+        var embedding: [Float]?
     }
 }

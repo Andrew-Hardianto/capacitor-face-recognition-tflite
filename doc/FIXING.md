@@ -8,7 +8,7 @@ rollback, dan daftar dist-tag ada di [DEPLOY.md](DEPLOY.md).
 | Jalur | Versi | dist-tag | Dikerjakan di | Dirilis dengan |
 |-------|-------|----------|---------------|----------------|
 | **latest** | 1.x | `latest` | branch kerja (`fix-bug`) | `npm run deploy` |
-| **legacy** | 0.0.x | `v0` | branch `legacy/0.x` (dari `main`) | `npm publish --tag v0` |
+| **legacy** | 0.0.x | `v0` | branch `legacy/0.x` (dari tag `v0.0.1`, **bukan** `main`) | `npm publish --tag v0` |
 
 Aturan penting: patch legacy **wajib** `--tag v0`. `npm run deploy` memakai
 `--tag latest` dan akan menimpa versi terbaru dengan versi lama.
@@ -33,11 +33,13 @@ Jika bug-nya juga ada di legacy, lanjut ke bagian C.
 
 ## B. Fix bug di LEGACY (0.0.x)
 
-Kerjakan di `main` lewat worktree terpisah supaya branch kerja tidak terganggu.
+Setelah 1.0.1 di-merge, `main` berisi kode 1.x — **jangan** membuat branch legacy dari
+`main`. Basisnya adalah tag `v0.0.1` (commit `558614e`, identik dengan tarball 0.0.1 di
+npm). Kerjakan lewat worktree terpisah supaya branch kerja tidak terganggu.
 
 ```bash
-# 1. Siapkan worktree dari main
-git worktree add ../face-legacy -b legacy/0.x main
+# 1. Siapkan worktree dari tag v0.0.1
+git worktree add ../face-legacy -b legacy/0.x v0.0.1
 cd ../face-legacy
 npm ci
 
@@ -60,12 +62,15 @@ cd - && git worktree remove ../face-legacy
 Jika branch `legacy/0.x` sudah ada (patch kedua dan seterusnya), pakai
 `git worktree add ../face-legacy legacy/0.x` tanpa `-b`.
 
+Catatan: `package.json` di tag `v0.0.1` belum punya script `deploy`; itu memang disengaja,
+patch legacy dirilis dengan `npm publish --tag v0` seperti di atas.
+
 ---
 
 ## C. Sinkronkan perbaikan antar versi
 
 `extractFaceFeature`, `compareFaces`, dan `checkLiveness` di 1.x adalah salinan
-perilaku `main`. Bug di tiga method itu hampir pasti ada di kedua jalur, jadi
+perilaku 0.0.1 (tag `v0.0.1`). Bug di tiga method itu hampir pasti ada di kedua jalur, jadi
 perbaiki di satu sisi lalu bawa ke sisi lain:
 
 ```bash
@@ -78,9 +83,9 @@ Perhatikan per method:
 
 | Method | Cherry-pick dari legacy ke 1.x |
 |--------|--------------------------------|
-| `extractFaceFeature` | Biasanya bisa, kodenya sama persis dengan `main` (Android: ditambah `synchronized`) |
+| `extractFaceFeature` | Biasanya bisa, kodenya sama persis dengan 0.0.1 (Android: ditambah `synchronized`) |
 | `compareFaces` | Biasanya bisa |
-| `checkLiveness` | **Perlu ditulis ulang.** Di 1.x ia memakai `runAntiSpoofInferenceLegacy` dan `antiSpoof27`, bukan `antiSpoofInterpreter` seperti `main` |
+| `checkLiveness` | **Perlu ditulis ulang.** Di 1.x ia memakai `runAntiSpoofInferenceLegacy` dan `antiSpoof27`, bukan `antiSpoofInterpreter` seperti di 0.0.1 |
 | `...V2`, `verifyFace`, dst. | Hanya ada di 1.x — perbaiki di jalur A saja |
 
 Bug yang hanya ada di pipeline baru (`...V2`, `verifyFace`, `verifyFaceSequence`,

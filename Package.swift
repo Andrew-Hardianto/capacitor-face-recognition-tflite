@@ -25,7 +25,8 @@ let package = Package(
             resources: [
                 // Model TFLite di-bundle otomatis ke dalam iOS app
                 .process("Resources/mobile_face_net.tflite"),
-                .process("Resources/anti_spoof.tflite"),
+                .process("Resources/anti_spoof_2_7.tflite"),
+                .process("Resources/anti_spoof_4_0.tflite"),
             ]),
         .testTarget(
             name: "FaceRecognitionPluginTests",
