@@ -88,6 +88,9 @@ The plugin includes both TFLite models directly in the package — **no manual d
 * [`extractFaceFeature(...)`](#extractfacefeature)
 * [`compareFaces(...)`](#comparefaces)
 * [`checkLiveness(...)`](#checkliveness)
+* [`extractFaceFeatureV2(...)`](#extractfacefeaturev2)
+* [`compareFacesV2(...)`](#comparefacesv2)
+* [`checkLivenessV2(...)`](#checklivenessv2)
 * [`detectFaces(...)`](#detectfaces)
 * [`verifyFace(...)`](#verifyface)
 * [`createChallengeSession()`](#createchallengesession)
@@ -108,8 +111,7 @@ The plugin includes both TFLite models directly in the package — **no manual d
 extractFaceFeature(options: { imageBase64: string; }) => Promise<{ embedding: number[]; }>
 ```
 
-Sends base64 image to Native, returning an array of numbers (embeddings).
-Embedding size: 192 (MobileFaceNet).
+Sends base64 image to Native, returning an array of numbers (embeddings)
 
 | Param         | Type                                  |
 | ------------- | ------------------------------------- |
@@ -123,7 +125,64 @@ Embedding size: 192 (MobileFaceNet).
 ### compareFaces(...)
 
 ```typescript
-compareFaces(options: { vector1: number[]; vector2: number[]; }) => Promise<{ isMatch: boolean; score: number; similarityPercentage: number; threshold: number; thresholdVersion: string; }>
+compareFaces(options: { vector1: number[]; vector2: number[]; }) => Promise<{ isMatch: boolean; score: number; similarityPercentage: number; }>
+```
+
+Compares two face embeddings using Cosine Similarity.
+Returns isMatch (0.75 threshold), cosine score, and similarity percentage.
+
+| Param         | Type                                                   |
+| ------------- | ------------------------------------------------------ |
+| **`options`** | <code>{ vector1: number[]; vector2: number[]; }</code> |
+
+**Returns:** <code>Promise&lt;{ isMatch: boolean; score: number; similarityPercentage: number; }&gt;</code>
+
+--------------------
+
+
+### checkLiveness(...)
+
+```typescript
+checkLiveness(options: { imageBase64: string; }) => Promise<{ isLive: boolean; score: number; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; }>
+```
+
+Checks if the face in the image is a real (live) face or a spoof
+(printed photo, phone screen, video, mask).
+
+Implementation: Multi-Scale MiniFASNet — inference twice (1.0x and 2.7x scales),
+results are averaged. Threshold 0.75.
+
+| Param         | Type                                  |
+| ------------- | ------------------------------------- |
+| **`options`** | <code>{ imageBase64: string; }</code> |
+
+**Returns:** <code>Promise&lt;{ isLive: boolean; score: number; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; }&gt;</code>
+
+--------------------
+
+
+### extractFaceFeatureV2(...)
+
+```typescript
+extractFaceFeatureV2(options: { imageBase64: string; }) => Promise<{ embedding: number[]; }>
+```
+
+Sends base64 image to Native, returning an array of numbers (embeddings).
+Embedding size: 192 (MobileFaceNet).
+
+| Param         | Type                                  |
+| ------------- | ------------------------------------- |
+| **`options`** | <code>{ imageBase64: string; }</code> |
+
+**Returns:** <code>Promise&lt;{ embedding: number[]; }&gt;</code>
+
+--------------------
+
+
+### compareFacesV2(...)
+
+```typescript
+compareFacesV2(options: { vector1: number[]; vector2: number[]; }) => Promise<{ isMatch: boolean; score: number; similarityPercentage: number; threshold: number; thresholdVersion: string; }>
 ```
 
 Compares two face embeddings using Cosine Similarity.
@@ -139,10 +198,10 @@ similarity percentage, and threshold metadata.
 --------------------
 
 
-### checkLiveness(...)
+### checkLivenessV2(...)
 
 ```typescript
-checkLiveness(options: { imageBase64: string; }) => Promise<{ isLive: boolean; score: number; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; label: LivenessLabel; liveScore: number; printScore: number; replayScore: number; thresholdVersion: string; }>
+checkLivenessV2(options: { imageBase64: string; }) => Promise<{ isLive: boolean; score: number; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; label: LivenessLabel; liveScore: number; printScore: number; replayScore: number; thresholdVersion: string; }>
 ```
 
 Checks if the face in the image is a real (live) face or a spoof
